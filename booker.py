@@ -321,6 +321,7 @@ async def pay(page: Page, debug: bool) -> bool:
 
     try:
         await page.click(
+            "#cs-stripe-elements-submit-button, "
             "button:has-text('Pay £'), button:has-text('Pay now'), "
             "button:has-text('Pay')",
             timeout=10_000,
