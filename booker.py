@@ -17,6 +17,7 @@ import logging
 import os
 import sys
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 from pathlib import Path
 
 import pytz
@@ -134,10 +135,21 @@ def secs_until(dt: datetime) -> float:
     return (dt - datetime.now(_tz())).total_seconds()
 
 
-async def shot(page: Page, name: str) -> None:
+async def shot(page: Page, name: str, full_page: bool = True) -> None:
     path = SHOTS_DIR / f"{name}.png"
-    await page.screenshot(path=str(path), full_page=True)
-    log.info(f"  Screenshot → screenshots/{name}.png")
+    try:
+        await page.screenshot(path=str(path), full_page=full_page, timeout=5_000)
+        log.info(f"  Screenshot → screenshots/{name}.png")
+    except Exception:
+        if full_page:
+            try:
+                # Modal overlays block full-page scrolling — fall back to viewport only
+                await page.screenshot(path=str(path), full_page=False, timeout=3_000)
+                log.info(f"  Screenshot (viewport) → screenshots/{name}.png")
+            except Exception as e:
+                log.warning(f"  Screenshot '{name}' failed (non-fatal): {e}")
+        else:
+            log.warning(f"  Screenshot '{name}' failed (non-fatal)")
 
 # ---------------------------------------------------------------------------
 # 1. Login
@@ -180,244 +192,179 @@ async def goto_booking_page(page: Page, date: str) -> None:
 # 3. Find and click an available 17:00 slot
 # ---------------------------------------------------------------------------
 
-async def click_slot(page: Page) -> bool:
+async def click_slot(page: Page, booking_time: str = BOOKING_TIME) -> bool:
     """
-    Try to click an available slot at BOOKING_TIME for any court in
-    PREFERRED_COURTS.  Three strategies tried in order.
+    Click the first available slot at booking_time.
+
+    The site encodes time as minutes-from-midnight in data-test-id:
+      e.g. 09:00 → 540,  17:00 → 1020
+    Available slots have class 'book-interval not-booked'.
     """
-    log.info(f"── Step 3: Finding {BOOKING_TIME} slot ───────────────")
+    log.info(f"── Step 3: Finding {booking_time} slot ────────────────")
 
-    # --- Strategy A: data-attribute selectors ---
-    for court in PREFERRED_COURTS:
-        for sel in [
-            f'[data-court="{court}"][data-time="{BOOKING_TIME}"]',
-            f'[data-resource="{court}"][data-slot="{BOOKING_TIME}"]',
-            f'[data-resource-id="{court}"][data-start-time="{BOOKING_TIME}"]',
-            f'td[data-court="{court}"][data-time="{BOOKING_TIME}"]',
-        ]:
-            el = await page.query_selector(sel)
-            if el and await el.is_visible() and await el.is_enabled():
-                log.info(f"Strategy A: clicking court {court} via '{sel}'")
-                await el.click()
-                await shot(page, f"04_clicked_court_{court}")
-                return True
+    h, m   = booking_time.split(":")
+    minutes = int(h) * 60 + int(m)
+    sel    = f'a.book-interval.not-booked[data-test-id*="|{minutes}"]'
+    log.info(f"Selector: {sel}")
 
-    log.info("Strategy A found nothing — trying strategy B (row-based) …")
+    try:
+        await page.wait_for_selector(sel, timeout=5_000)
+    except Exception:
+        log.error(f"No available slot found for {booking_time} (minutes={minutes}). Check 04_no_slot_found.png.")
+        await shot(page, "04_no_slot_found")
+        return False
 
-    # --- Strategy B: find the court's row, then the matching time cell ---
-    for court in PREFERRED_COURTS:
-        row = await page.query_selector(
-            f'tr[data-court="{court}"], '
-            f'.court-row[data-court="{court}"], '
-            f'[class*="court"][data-id="{court}"], '
-            f'[data-resource="{court}"]'
-        )
-        if row:
-            slot = await row.query_selector(
-                f'[data-time="{BOOKING_TIME}"], '
-                'td.available, td.open, .slot.available'
-            )
-            if slot and await slot.is_visible():
-                log.info(f"Strategy B: clicking court {court} slot in row")
-                await slot.click()
-                await shot(page, f"04_clicked_court_{court}_rowstrat")
-                return True
-
-    log.info("Strategy B found nothing — trying strategy C (text match) …")
-
-    # --- Strategy C: scan all visible available cells for the right time ---
-    cells = await page.query_selector_all(
-        '.available:not(.disabled), .bookable:not(.disabled), '
-        'td.available, td.open, '
-        '.slot:not(.disabled):not(.unavailable):not(.booked)'
-    )
-    for cell in cells:
-        text  = (await cell.inner_text()).strip()
-        title = (await cell.get_attribute("title") or "").strip()
-        if BOOKING_TIME in text or BOOKING_TIME in title:
-            log.info(f"Strategy C: clicking cell with text='{text}' title='{title}'")
-            await cell.click()
-            await shot(page, "04_clicked_text_match")
-            return True
-
-    log.error(
-        f"Could not find any available {BOOKING_TIME} slot. "
-        "Check screenshots/03_booking_page.png to inspect the page."
-    )
-    await shot(page, "04_no_slot_found")
-    return False
+    el = await page.query_selector(sel)
+    text = (await el.inner_text()).strip()
+    log.info(f"Clicking slot: '{text}'")
+    await el.click()
+    await shot(page, "04_clicked_slot")
+    return True
 
 # ---------------------------------------------------------------------------
-# 4. Confirm the booking popup
+# 4. Click "Continue booking" in the slot popup
 # ---------------------------------------------------------------------------
 
 async def confirm_popup(page: Page) -> bool:
-    log.info("── Step 4: Confirming popup ───────────────────")
+    """After clicking a slot, a popup appears. Click the green 'Continue booking' button."""
+    log.info("── Step 4: Continue booking popup ────────────")
 
-    modal_sel = (
-        ".modal.show, .modal[style*='display: block'], "
-        "[role='dialog'], .popup, .booking-popup, "
-        ".booking-details, #bookingModal"
-    )
     try:
-        await page.wait_for_selector(modal_sel, timeout=6_000)
+        await page.wait_for_selector("#submit-booking", timeout=8_000)
         await shot(page, "05_popup")
     except Exception:
-        # Some sites navigate directly to a confirmation page without a modal
-        log.info("No modal appeared — may have auto-navigated to confirmation page.")
-        await shot(page, "05_no_popup")
-
-    confirm_sel = (
-        "button:has-text('Confirm'), button:has-text('Book'), "
-        "button:has-text('Next'), button:has-text('Continue'), "
-        "button:has-text('Proceed'), .btn-confirm, .btn-primary"
-    )
-    try:
-        await page.click(confirm_sel, timeout=6_000)
-        log.info("Clicked confirm.")
-        await page.wait_for_load_state("networkidle", timeout=15_000)
-        await shot(page, "06_after_confirm")
-        return True
-    except Exception as e:
-        log.error(f"Could not click confirm button: {e}")
-        await shot(page, "06_confirm_failed")
+        log.error("'Continue booking' button did not appear. Check 05_popup.png.")
+        await shot(page, "05_popup")
         return False
 
+    # Click and wait for navigation to /Booking/Book
+    async with page.expect_navigation(timeout=20_000):
+        await page.click("#submit-booking")
+    log.info("Clicked 'Continue booking', navigated to booking page.")
+    await shot(page, "06_booking_page")
+    return True
+
+
 # ---------------------------------------------------------------------------
-# 5. Payment
+# 5. Click "Confirm and pay", fill card details, optionally submit
 # ---------------------------------------------------------------------------
 
 async def pay(page: Page, debug: bool) -> bool:
-    log.info("── Step 5: Payment ────────────────────────────")
-    await shot(page, "07_payment_page")
+    """
+    On the /Booking/Book page:
+      1. Click green 'Confirm and pay' button
+      2. Card details popup appears — fill in card fields
+      3. Real mode:  click 'Pay £...' to complete
+         Debug mode: stop after filling (do NOT click pay)
+    """
+    log.info("── Step 5: Confirm and pay ────────────────────")
 
-    if debug:
-        log.info("[DEBUG MODE] Skipping payment — inspect screenshots/ to verify.")
-        return True
-
-    if not CARD_NUMBER:
-        log.error("CARD_NUMBER is not set in .env — cannot complete payment.")
+    # -- 5a. Click "Confirm and pay" --
+    try:
+        await page.wait_for_selector(
+            "button:has-text('Confirm and pay')",
+            timeout=10_000,
+        )
+        await shot(page, "07_confirm_and_pay_page")
+        await page.click("button:has-text('Confirm and pay')")
+        log.info("Clicked 'Confirm and pay'.")
+    except Exception as e:
+        log.error(f"Could not find 'Confirm and pay' button: {e}")
+        await shot(page, "07_confirm_and_pay_error")
         return False
 
-    filled = False
+    # -- 5b. Wait for Stripe payment form --
+    # Stripe Elements renders each field inside its own iframe.
+    # The container divs (on the main page) have ids from the label for= attributes.
+    try:
+        await page.wait_for_selector(
+            'iframe[title="Secure card number input frame"]',
+            timeout=10_000,
+        )
+        await shot(page, "08_card_popup", full_page=False)
+        log.info("Stripe payment form appeared.")
+    except Exception as e:
+        log.error(f"Stripe payment form did not appear: {e}")
+        await shot(page, "08_card_popup_error")
+        return False
 
-    # --- Try iframe-based payment (Stripe, Braintree, etc.) ---
-    iframe_sels = [
-        "iframe[name*='card']",
-        "iframe[src*='stripe']",
-        "iframe[src*='braintree']",
-        "iframe[title*='card']",
-        "iframe[title*='payment']",
-        "iframe[src*='pay']",
-    ]
-    for iframe_sel in iframe_sels:
-        iframe_el = await page.query_selector(iframe_sel)
-        if not iframe_el:
-            continue
-        log.info(f"Found payment iframe: {iframe_sel}")
-        frame = page.frame_locator(iframe_sel)
-        try:
-            await frame.locator(
-                "input[placeholder*='card number'], input[name*='cardnumber'], "
-                "input[placeholder*='1234 1234']"
-            ).fill(CARD_NUMBER, timeout=5_000)
-            await frame.locator(
-                "input[placeholder*='MM / YY'], input[placeholder*='MM/YY'], "
-                "input[name*='exp']"
-            ).fill(CARD_EXPIRY)
-            await frame.locator(
-                "input[placeholder*='CVC'], input[placeholder*='CVV'], "
-                "input[name*='cvc'], input[name*='cvv']"
-            ).fill(CARD_CVV)
-            log.info("Filled card details in iframe.")
-            filled = True
-            break
-        except Exception as e:
-            log.warning(f"iframe fill failed ({iframe_sel}): {e}")
+    if not CARD_NUMBER:
+        log.error("CARD_NUMBER is not set in .env — cannot fill payment.")
+        return False
 
-    # --- Fallback: direct form fields ---
-    if not filled:
-        log.info("No iframe — trying direct form fields …")
-        try:
-            await page.fill(
-                'input[autocomplete="cc-number"], '
-                'input[name*="card_number"], input[id*="card-number"], '
-                'input[placeholder*="card number"]',
-                CARD_NUMBER,
-            )
-            await page.fill(
-                'input[autocomplete="cc-exp"], '
-                'input[name*="expiry"], input[id*="expiry"], '
-                'input[placeholder*="MM"]',
-                CARD_EXPIRY,
-            )
-            await page.fill(
-                'input[autocomplete="cc-csc"], '
-                'input[name*="cvv"], input[name*="cvc"], '
-                'input[id*="cvv"], input[id*="cvc"]',
-                CARD_CVV,
-            )
-            if CARD_NAME:
-                await page.fill(
-                    'input[autocomplete="cc-name"], '
-                    'input[name*="cardholder"], input[id*="card-name"]',
-                    CARD_NAME,
-                )
-            log.info("Filled card details directly on page.")
-            filled = True
-        except Exception as e:
-            log.error(f"Could not fill card details: {e}")
-            await shot(page, "07_card_fill_error")
-            return False
+    # -- 5c. Fill Stripe iframe fields --
+    # Each Stripe field is in its own iframe, identified by the title attribute.
+    try:
+        await page.frame_locator('iframe[title="Secure card number input frame"]') \
+            .locator('input[placeholder*="1234"]').fill(CARD_NUMBER)
+        log.info("Filled card number.")
 
-    await shot(page, "08_card_filled")
+        await page.frame_locator('iframe[title="Secure expiration date input frame"]') \
+            .locator('input[placeholder*="MM"]').fill(CARD_EXPIRY)
+        log.info("Filled expiry.")
 
-    # Submit payment
+        await page.frame_locator('iframe[title="Secure CVC input frame"]') \
+            .locator('input[name="cvc"]').fill(CARD_CVV)
+        log.info("Filled CVC.")
+
+        await shot(page, "09_card_filled", full_page=False)
+        log.info("Card details filled.")
+    except Exception as e:
+        log.error(f"Could not fill card details: {e}")
+        await shot(page, "09_card_fill_error")
+        return False
+
+    # -- 5d. Submit (real mode only) --
+    if debug:
+        log.info("[DEBUG] Card details filled. Stopping before 'Pay £...' — inspect 09_card_filled.png.")
+        return True
+
     try:
         await page.click(
-            "button:has-text('Pay'), button:has-text('Pay now'), "
-            "button:has-text('Complete payment'), button:has-text('Confirm and pay'), "
-            "input[type='submit']",
+            "button:has-text('Pay £'), button:has-text('Pay now'), "
+            "button:has-text('Pay')",
             timeout=10_000,
         )
         log.info("Clicked Pay.")
     except Exception as e:
         log.error(f"Could not click Pay button: {e}")
-        await shot(page, "08_pay_btn_error")
+        await shot(page, "10_pay_btn_error")
         return False
 
     # Wait for confirmation
     try:
         await page.wait_for_selector(
-            ".confirmation, .booking-confirmed, "
             "h1:has-text('Confirmed'), h2:has-text('Confirmed'), "
             "h1:has-text('Thank you'), p:has-text('successfully booked'), "
-            ".alert-success, [class*='success']",
+            ".booking-confirmed, .alert-success",
             timeout=20_000,
         )
-        await shot(page, "09_booking_confirmed")
+        await shot(page, "10_booking_confirmed")
         log.info("✓ BOOKING CONFIRMED!")
         return True
     except Exception:
-        log.error("Could not detect confirmation page — check 09_unknown.png")
-        await shot(page, "09_unknown")
+        log.error("Could not detect confirmation — check 10_unknown.png")
+        await shot(page, "10_unknown")
         return False
 
 # ---------------------------------------------------------------------------
 # Main session
 # ---------------------------------------------------------------------------
 
-async def run(debug: bool, skip_wait: bool) -> None:
-    date      = target_date()
-    midnight  = midnight_tonight()
-    wait_secs = secs_until(midnight)
+async def run(debug: bool, skip_wait: bool, date_override: Optional[str] = None, time_override: Optional[str] = None) -> None:
+    date         = date_override  if date_override  else target_date()
+    booking_time = time_override  if time_override  else BOOKING_TIME
+    midnight     = midnight_tonight()
+    wait_secs    = secs_until(midnight)
 
     log.info("=" * 55)
-    log.info(f"Target date    : {date}  at  {BOOKING_TIME}")
+    log.info(f"Target date    : {date}  at  {booking_time}")
+    if date_override or time_override:
+        log.info("Mode           : MANUAL OVERRIDE")
     log.info(f"Booking opens  : {midnight.strftime('%Y-%m-%d %H:%M:%S %Z')}")
     log.info(f"Time until open: {wait_secs / 3600:.2f} h  ({wait_secs:.0f} s)")
     if debug:
-        log.info("Mode           : DEBUG (no payment will be made)")
+        log.info("Mode           : DEBUG (card details filled but Pay not clicked)")
     log.info("=" * 55)
 
     # Sleep until PRE_LOGIN_SECS before midnight (unless skipping)
@@ -463,7 +410,7 @@ async def run(debug: bool, skip_wait: bool) -> None:
             log.info("Skipping midnight wait.")
 
         # ── Find & click slot ──
-        if not await click_slot(page):
+        if not await click_slot(page, booking_time):
             await browser.close()
             return
 
@@ -491,10 +438,18 @@ if __name__ == "__main__":
         "--now", action="store_true",
         help="Skip the midnight wait — useful for testing with --debug",
     )
+    parser.add_argument(
+        "--date", default=None, metavar="YYYY-MM-DD",
+        help="Override target date (e.g. 2026-03-04). Default: auto-calculate from tonight's midnight.",
+    )
+    parser.add_argument(
+        "--time", default=None, metavar="HH:MM",
+        help="Override booking time (e.g. 09:00). Default: value from config.json.",
+    )
     args = parser.parse_args()
 
     if not USERNAME or not PASSWORD:
         log.error("BOOKING_USERNAME and BOOKING_PASSWORD must be set in .env")
         sys.exit(1)
 
-    asyncio.run(run(debug=args.debug, skip_wait=args.now))
+    asyncio.run(run(debug=args.debug, skip_wait=args.now, date_override=args.date, time_override=args.time))
