@@ -106,6 +106,8 @@ def build_login_url() -> str:
 SHOTS_DIR = _HERE / "screenshots"
 SHOTS_DIR.mkdir(exist_ok=True)
 
+_SCREENSHOTS_ENABLED = False  # set to True in debug mode only
+
 # ---------------------------------------------------------------------------
 # Timing helpers
 # ---------------------------------------------------------------------------
@@ -136,6 +138,8 @@ def secs_until(dt: datetime) -> float:
 
 
 async def shot(page: Page, name: str, full_page: bool = True) -> None:
+    if not _SCREENSHOTS_ENABLED:
+        return
     path = SHOTS_DIR / f"{name}.png"
     try:
         await page.screenshot(path=str(path), full_page=full_page, timeout=5_000)
@@ -353,6 +357,9 @@ async def pay(page: Page, debug: bool) -> bool:
 # ---------------------------------------------------------------------------
 
 async def run(debug: bool, skip_wait: bool, date_override: Optional[str] = None, time_override: Optional[str] = None) -> None:
+    global _SCREENSHOTS_ENABLED
+    _SCREENSHOTS_ENABLED = debug
+
     date         = date_override  if date_override  else target_date()
     booking_time = time_override  if time_override  else BOOKING_TIME
     midnight     = midnight_tonight()
