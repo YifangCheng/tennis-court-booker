@@ -144,16 +144,16 @@ async def shot(page: Page, name: str, full_page: bool = True) -> None:
     try:
         await page.screenshot(path=str(path), full_page=full_page, timeout=5_000)
         log.info(f"  Screenshot → screenshots/{name}.png")
-    except Exception:
+    except Exception as e:
         if full_page:
             try:
                 # Modal overlays block full-page scrolling — fall back to viewport only
                 await page.screenshot(path=str(path), full_page=False, timeout=3_000)
                 log.info(f"  Screenshot (viewport) → screenshots/{name}.png")
-            except Exception as e:
-                log.warning(f"  Screenshot '{name}' failed (non-fatal): {e}")
+            except Exception as e2:
+                log.warning(f"  Screenshot '{name}' failed (non-fatal): {e2}")
         else:
-            log.warning(f"  Screenshot '{name}' failed (non-fatal)")
+            log.warning(f"  Screenshot '{name}' failed (non-fatal): {e}")
 
 # ---------------------------------------------------------------------------
 # 1. Login
