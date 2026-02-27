@@ -1,25 +1,26 @@
 #!/usr/bin/env python3
 """
 Tennis Court Booker — Raynes Park
-Automatically books a court (4-9) at 17:00 on the first day that becomes
-bookable at tonight's midnight (i.e. today + 14 days).
+Automatically books an indoor court at the configured time on the first day
+that becomes bookable at tonight's midnight (i.e. today + 14 days).
 
 Usage:
-  python booker.py                  # real run — waits for midnight, then books
-  python booker.py --debug          # screenshots at every step, skips payment
-  python booker.py --now            # skip the midnight wait (use with --debug first)
-  python booker.py --debug --now    # run right now in debug mode — start here!
+  python booker.py                                          # production — waits for midnight, then books & pays
+  python booker.py --debug --now --date YYYY-MM-DD --time HH:MM   # dry-run — screenshots, no payment
+  python booker.py --debug --now --pay --date YYYY-MM-DD --time HH:MM  # book now — screenshots + real payment
+  python booker.py --now                                    # production logic but skip midnight wait
 """
 
 import argparse
 import asyncio
+import json as _json
 import logging
+import ntplib
 import os
 import sys
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 from pathlib import Path
-
 import pytz
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright, Page
@@ -36,7 +37,8 @@ logging.basicConfig(
     format="%(asctime)s  %(levelname)-7s  %(message)s",
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler(_HERE / "booker.log"),
+        # No FileHandler — LaunchAgent already redirects stdout → booker.log.
+        # Having both caused every line to appear twice.
     ],
 )
 log = logging.getLogger(__name__)
@@ -51,10 +53,31 @@ with open(_HERE / "config.json") as _f:
     _cfg = json.load(_f)
 
 TZ_NAME          = _cfg.get("timezone",          "Europe/London")
+BOOKING_DATE     = _cfg.get("booking_date",       None)   # null = auto-calculate from midnight
 BOOKING_TIME     = _cfg.get("booking_time",       "17:00")
 PREFERRED_COURTS = _cfg.get("preferred_courts",   [4, 5, 6, 7, 8, 9])
+COURT_TYPE       = _cfg.get("court_type",         "indoor")
 HEADLESS         = _cfg.get("headless",           True)
 PRE_LOGIN_SECS   = _cfg.get("pre_login_seconds",  120)
+
+# Resource IDs from the venue API (GetVenueSessions)
+COURT_RESOURCE_IDS = {
+    ("indoor", 4): "4198fda4-6886-4e97-9355-2d808c37873e",
+    ("indoor", 5): "749e1d69-d2f6-48ac-a571-0f5b6ba820b6",
+    ("indoor", 6): "9154426c-24e4-4117-921d-ca0032a80383",
+    ("indoor", 7): "fad29dbc-537e-4a6b-8509-d4b1c842ba54",
+    ("indoor", 8): "eb2465b3-a53c-4163-9b97-ea98ec4d216d",
+    ("indoor", 9): "d4913519-e446-4c2a-9407-90ac73ef43cf",
+    ("outdoor", 1): "c283db85-53e9-43ce-9375-30cf7b6d30de",
+    ("outdoor", 2): "da22e6ea-be6e-4bfc-8e9a-9b5c642b33bc",
+    ("outdoor", 3): "aa6abe54-7550-4b19-9f20-d998bd418358",
+    ("grass", 1): "f89c880c-2872-4bf3-a9ba-ad90bd9240e4",
+    ("grass", 2): "5b348cbc-c6b4-4b51-b4e7-3d5be51d6ebd",
+    ("grass", 3): "d9dd1e93-19a5-4463-b0ac-4ffb84849098",
+    ("grass", 4): "fe653dda-88ed-4ba2-b8b8-94ef1c4e4fea",
+    ("grass", 5): "165d3984-87e6-4a59-a086-e3cc1c45eab3",
+    ("grass", 6): "10c84f5d-3f12-418e-859a-cdec21e80c78",
+}
 
 USERNAME    = os.environ.get("BOOKING_USERNAME", "")
 PASSWORD    = os.environ.get("BOOKING_PASSWORD", "")
@@ -66,6 +89,8 @@ CARD_NAME   = os.environ.get("CARD_NAME",   "")
 BASE_URL    = "https://raynespark.communitysport.aeltc.com"
 AUTH_BASE   = "https://auth.communitysport.aeltc.com"
 BOOKING_URL = f"{BASE_URL}/Booking/BookByDate"
+VENUE_ID    = "a750357b-8670-4b34-a7e8-9c4660577b29"  # Raynes Park
+VENUE_SLUG  = "raynespark_communitysport_aeltc_com"
 
 
 def build_login_url() -> str:
@@ -108,6 +133,63 @@ SHOTS_DIR.mkdir(exist_ok=True)
 
 _SCREENSHOTS_ENABLED = False  # set to True in debug mode only
 
+NETWORK_LOG_PATH = _HERE / "network_log.json"
+
+# ---------------------------------------------------------------------------
+# Network request capture (debug mode only)
+# ---------------------------------------------------------------------------
+
+def attach_network_logger(page) -> list:
+    """Silently capture all XHR/fetch requests. Saves to JSON, no console spam."""
+    entries = []
+
+    def _on_request(request):
+        is_xhr = request.resource_type in ("xhr", "fetch")
+        is_post_doc = request.resource_type == "document" and request.method != "GET"
+        if not (is_xhr or is_post_doc):
+            return
+        try:
+            body = request.post_data
+        except Exception:
+            buf = request.post_data_buffer
+            body = f"<binary {len(buf)} bytes>" if buf else None
+        entries.append({
+            "method": request.method,
+            "url":    request.url,
+            "headers": dict(request.headers),
+            "post_data": body,
+            "responses": [],
+        })
+
+    page.on("request", _on_request)
+    return entries
+
+
+async def attach_network_response_logger(page, entries: list) -> None:
+    """Silently capture responses and attach to matching request entries."""
+    async def _on_response(response):
+        req = response.request
+        is_xhr = req.resource_type in ("xhr", "fetch")
+        is_post_doc = req.resource_type == "document" and req.method != "GET"
+        if not (is_xhr or is_post_doc):
+            return
+        try:
+            body = await response.text()
+        except Exception:
+            body = "<could not read body>"
+        for entry in reversed(entries):
+            if entry["url"] == response.url:
+                entry["responses"].append({"status": response.status, "body": body[:50000]})
+                break
+
+    page.on("response", _on_response)
+
+
+def save_network_log(entries: list) -> None:
+    with open(NETWORK_LOG_PATH, "w") as f:
+        _json.dump(entries, f, indent=2)
+    log.info(f"Network log → {NETWORK_LOG_PATH.name} ({len(entries)} entries)")
+
 # ---------------------------------------------------------------------------
 # Timing helpers
 # ---------------------------------------------------------------------------
@@ -116,10 +198,31 @@ def _tz() -> pytz.BaseTzInfo:
     return pytz.timezone(TZ_NAME)
 
 
+# NTP offset: seconds to ADD to local time to get true wall-clock time.
+# Populated by sync_ntp() at startup; 0.0 means "use local clock as-is".
+_ntp_offset: float = 0.0
+
+
+def sync_ntp(server: str = "pool.ntp.org") -> None:
+    """Query an NTP server and store the local-clock offset."""
+    global _ntp_offset
+    try:
+        resp = ntplib.NTPClient().request(server, version=3)
+        _ntp_offset = resp.offset
+        log.info(f"NTP sync OK  offset={_ntp_offset:+.3f}s  (server={server})")
+    except Exception as e:
+        log.warning(f"NTP sync failed — using local clock: {e}")
+
+
+def now_true() -> datetime:
+    """Current time corrected for any local-clock drift vs NTP."""
+    return datetime.now(_tz()) + timedelta(seconds=_ntp_offset)
+
+
 def midnight_tonight() -> datetime:
     """Start of tomorrow in local time — when the new booking window opens."""
     tz       = _tz()
-    tomorrow = datetime.now(tz).date() + timedelta(days=1)
+    tomorrow = now_true().date() + timedelta(days=1)
     return tz.localize(datetime(tomorrow.year, tomorrow.month, tomorrow.day))
 
 
@@ -128,13 +231,21 @@ def target_date() -> str:
     The court date that becomes bookable at tonight's midnight.
     'Up to 13 days in advance' means at midnight on day X, day X+13 opens.
     """
-    tz       = _tz()
-    tomorrow = datetime.now(tz).date() + timedelta(days=1)
+    tomorrow = now_true().date() + timedelta(days=1)
     return (tomorrow + timedelta(days=13)).strftime("%Y-%m-%d")
 
 
 def secs_until(dt: datetime) -> float:
-    return (dt - datetime.now(_tz())).total_seconds()
+    return (dt - now_true()).total_seconds()
+
+
+async def _dismiss_cookie_banner(page: Page) -> None:
+    """Remove the cookie consent overlay so it doesn't block clicks."""
+    try:
+        await page.evaluate("document.querySelector('.osano-cm-dialog')?.remove()")
+        await page.evaluate("document.querySelector('.osano-cm-overlay')?.remove()")
+    except Exception:
+        pass
 
 
 async def shot(page: Page, name: str, full_page: bool = True) -> None:
@@ -160,9 +271,7 @@ async def shot(page: Page, name: str, full_page: bool = True) -> None:
 # ---------------------------------------------------------------------------
 
 async def login(page: Page) -> bool:
-    log.info("── Step 1: Login ──────────────────────────────")
     login_url = build_login_url()
-    log.info(f"Auth URL built with timestamp: {login_url[:80]}…")
     await page.goto(login_url, wait_until="networkidle", timeout=30_000)
     await page.wait_for_selector("#EmailAddress", timeout=15_000)
     await shot(page, "01_login_page")
@@ -174,10 +283,10 @@ async def login(page: Page) -> bool:
     await shot(page, "02_after_login")
 
     if "signin" in page.url.lower() or "login" in page.url.lower():
-        log.error("Login failed — are BOOKING_USERNAME / BOOKING_PASSWORD correct?")
+        log.error("Login failed — check credentials")
         return False
 
-    log.info("Login successful.")
+    log.info("Login OK")
     return True
 
 # ---------------------------------------------------------------------------
@@ -186,65 +295,72 @@ async def login(page: Page) -> bool:
 
 async def goto_booking_page(page: Page, date: str) -> None:
     url = f"{BOOKING_URL}#?date={date}&role=member"
-    log.info(f"── Step 2: Booking page ({url}) ──────────────")
     await page.goto(url, wait_until="networkidle", timeout=30_000)
-    # SPA needs a moment to render the timetable
-    await asyncio.sleep(1.5)
+    await asyncio.sleep(1.5)  # SPA render
+    log.info(f"Booking page loaded ({date})")
     await shot(page, "03_booking_page")
 
 # ---------------------------------------------------------------------------
-# 3. Find and click an available 17:00 slot
+# 3. Find and click an available slot on a preferred court
 # ---------------------------------------------------------------------------
 
 async def click_slot(page: Page, booking_time: str = BOOKING_TIME) -> bool:
-    """
-    Click the first available slot at booking_time.
-
-    The site encodes time as minutes-from-midnight in data-test-id:
-      e.g. 09:00 → 540,  17:00 → 1020
-    Available slots have class 'book-interval not-booked'.
-    """
-    log.info(f"── Step 3: Finding {booking_time} slot ────────────────")
-
+    """Click first available slot at booking_time on a preferred court."""
     h, m   = booking_time.split(":")
     minutes = int(h) * 60 + int(m)
-    sel    = f'a.book-interval.not-booked[data-test-id*="|{minutes}"]'
-    log.info(f"Selector: {sel}")
 
+    # Build list of resource IDs for preferred courts, in order
+    resource_ids = []
+    for court_num in PREFERRED_COURTS:
+        rid = COURT_RESOURCE_IDS.get((COURT_TYPE, court_num))
+        if rid:
+            resource_ids.append((court_num, rid))
+
+    if not resource_ids:
+        log.error(f"No resource IDs for court_type={COURT_TYPE} courts={PREFERRED_COURTS}")
+        return False
+
+    # Wait for any slot at this time to appear on the page
+    # Format: booking-{resourceID}|{date}|{minutes}
+    any_sel = f'a.book-interval.not-booked[data-test-id$="|{minutes}"]'
     try:
-        await page.wait_for_selector(sel, timeout=5_000)
+        await page.wait_for_selector(any_sel, timeout=15_000)
     except Exception:
-        log.error(f"No available slot found for {booking_time} (minutes={minutes}). Check 04_no_slot_found.png.")
+        log.error(f"No slot at {booking_time}")
         await shot(page, "04_no_slot_found")
         return False
 
-    el = await page.query_selector(sel)
-    text = (await el.inner_text()).strip()
-    log.info(f"Clicking slot: '{text}'")
-    await el.click()
-    await shot(page, "04_clicked_slot")
-    return True
+    # Try each preferred court in order
+    for court_num, rid in resource_ids:
+        sel = f'a.book-interval.not-booked[data-test-id^="booking-{rid}"][data-test-id$="|{minutes}"]'
+        el = await page.query_selector(sel)
+        if el:
+            await el.click()
+            log.info(f"Slot clicked — Court {court_num} ({COURT_TYPE}) at {booking_time}")
+            await shot(page, "04_clicked_slot")
+            return True
+
+    log.error(f"No available {COURT_TYPE} slot at {booking_time} for courts {PREFERRED_COURTS}")
+    await shot(page, "04_no_slot_found")
+    return False
 
 # ---------------------------------------------------------------------------
 # 4. Click "Continue booking" in the slot popup
 # ---------------------------------------------------------------------------
 
 async def confirm_popup(page: Page) -> bool:
-    """After clicking a slot, a popup appears. Click the green 'Continue booking' button."""
-    log.info("── Step 4: Continue booking popup ────────────")
-
+    """Click 'Continue booking' in the popup → navigates to /Booking/Book."""
     try:
         await page.wait_for_selector("#submit-booking", timeout=8_000)
         await shot(page, "05_popup")
     except Exception:
-        log.error("'Continue booking' button did not appear. Check 05_popup.png.")
+        log.error("'Continue booking' not found")
         await shot(page, "05_popup")
         return False
 
-    # Click and wait for navigation to /Booking/Book
     async with page.expect_navigation(timeout=20_000):
         await page.click("#submit-booking")
-    log.info("Clicked 'Continue booking', navigated to booking page.")
+    log.info("Continue booking → /Booking/Book")
     await shot(page, "06_booking_page")
     return True
 
@@ -253,90 +369,81 @@ async def confirm_popup(page: Page) -> bool:
 # 5. Click "Confirm and pay", fill card details, optionally submit
 # ---------------------------------------------------------------------------
 
-async def pay(page: Page, debug: bool) -> bool:
-    """
-    On the /Booking/Book page:
-      1. Click green 'Confirm and pay' button
-      2. Card details popup appears — fill in card fields
-      3. Real mode:  click 'Pay £...' to complete
-         Debug mode: stop after filling (do NOT click pay)
-    """
-    log.info("── Step 5: Confirm and pay ────────────────────")
+async def pay(page: Page, dry_run: bool) -> bool:
+    """Confirm and pay: click button → fill Stripe → submit."""
 
-    # -- 5a. Click "Confirm and pay" --
+    await _dismiss_cookie_banner(page)
+
+    # -- Click "Confirm and pay" (45s timeout for midnight server load) --
     try:
         await page.wait_for_selector(
-            "button:has-text('Confirm and pay')",
-            timeout=10_000,
+            "button:has-text('Confirm and pay')", timeout=45_000,
         )
-        await shot(page, "07_confirm_and_pay_page")
-        await page.click("button:has-text('Confirm and pay')")
-        log.info("Clicked 'Confirm and pay'.")
+        await _dismiss_cookie_banner(page)
+        await page.locator("button:has-text('Confirm and pay')").click(force=True)
+        log.info("Confirm and pay clicked")
     except Exception as e:
-        log.error(f"Could not find 'Confirm and pay' button: {e}")
-        await shot(page, "07_confirm_and_pay_error")
+        log.error(f"'Confirm and pay' not found: {e}")
+        try:
+            path = SHOTS_DIR / "07_error.png"
+            await page.screenshot(path=str(path), full_page=False, timeout=3_000)
+            log.error(f"Page text: {(await page.inner_text('body'))[:500]}")
+        except Exception:
+            pass
         return False
 
-    # -- 5b. Wait for Stripe payment form --
-    # Stripe Elements renders each field inside its own iframe.
-    # The container divs (on the main page) have ids from the label for= attributes.
+    # -- Wait for Stripe iframes --
     try:
         await page.wait_for_selector(
-            'iframe[title="Secure card number input frame"]',
-            timeout=10_000,
+            'iframe[title="Secure card number input frame"]', timeout=10_000,
         )
-        await shot(page, "08_card_popup", full_page=False)
-        log.info("Stripe payment form appeared.")
     except Exception as e:
-        log.error(f"Stripe payment form did not appear: {e}")
-        await shot(page, "08_card_popup_error")
+        log.error(f"Stripe form not found: {e}")
         return False
 
     if not CARD_NUMBER:
-        log.error("CARD_NUMBER is not set in .env — cannot fill payment.")
+        log.error("CARD_NUMBER not set")
         return False
 
-    # -- 5c. Fill Stripe iframe fields --
-    # Each Stripe field is in its own iframe, identified by the title attribute.
+    # -- Fill card fields sequentially (Stripe iframes reject .fill()) --
     try:
-        await page.frame_locator('iframe[title="Secure card number input frame"]') \
-            .locator('input[placeholder*="1234"]').fill(CARD_NUMBER)
-        log.info("Filled card number.")
+        num_input = page.frame_locator('iframe[title="Secure card number input frame"]') \
+            .locator('input[placeholder*="1234"]')
+        await num_input.click()
+        await num_input.press_sequentially(CARD_NUMBER, delay=50)
 
-        await page.frame_locator('iframe[title="Secure expiration date input frame"]') \
-            .locator('input[placeholder*="MM"]').fill(CARD_EXPIRY)
-        log.info("Filled expiry.")
+        exp_input = page.frame_locator('iframe[title="Secure expiration date input frame"]') \
+            .locator('input[placeholder*="MM"]')
+        await exp_input.click()
+        await exp_input.press_sequentially(CARD_EXPIRY, delay=50)
 
-        await page.frame_locator('iframe[title="Secure CVC input frame"]') \
-            .locator('input[name="cvc"]').fill(CARD_CVV)
-        log.info("Filled CVC.")
+        cvc_input = page.frame_locator('iframe[title="Secure CVC input frame"]') \
+            .locator('input[name="cvc"]')
+        await cvc_input.click()
+        await cvc_input.press_sequentially(CARD_CVV, delay=50)
 
+        log.info("Card filled")
+        await asyncio.sleep(1)  # let Stripe validate
         await shot(page, "09_card_filled", full_page=False)
-        log.info("Card details filled.")
     except Exception as e:
-        log.error(f"Could not fill card details: {e}")
-        await shot(page, "09_card_fill_error")
+        log.error(f"Card fill failed: {e}")
         return False
 
-    # -- 5d. Submit (real mode only) --
-    if debug:
-        log.info("[DEBUG] Card details filled. Stopping before 'Pay £...' — inspect 09_card_filled.png.")
+    if dry_run:
+        log.info("[DRY-RUN] Stopping before Pay — card filled but not submitted")
         return True
 
+    # -- Submit payment --
+    await _dismiss_cookie_banner(page)
+    await shot(page, "08_before_pay", full_page=False)
     try:
-        await page.click(
-            "#cs-stripe-elements-submit-button, "
-            "button:has-text('Pay £'), button:has-text('Pay now'), "
-            "button:has-text('Pay')",
-            timeout=10_000,
-        )
-        log.info("Clicked Pay.")
+        await page.locator("#cs-stripe-elements-submit-button").click(force=True, timeout=10_000)
+        log.info("Pay clicked")
     except Exception as e:
-        log.error(f"Could not click Pay button: {e}")
-        await shot(page, "10_pay_btn_error")
+        log.error(f"Pay button failed: {e}")
         return False
 
-    # Wait for confirmation
+    # -- Wait for confirmation --
     try:
         await page.wait_for_selector(
             "h1:has-text('Confirmed'), h2:has-text('Confirmed'), "
@@ -344,42 +451,39 @@ async def pay(page: Page, debug: bool) -> bool:
             ".booking-confirmed, .alert-success",
             timeout=20_000,
         )
-        await shot(page, "10_booking_confirmed")
-        log.info("✓ BOOKING CONFIRMED!")
+        log.info("BOOKING CONFIRMED!")
         return True
     except Exception:
-        log.error("Could not detect confirmation — check 10_unknown.png")
+        log.error("Confirmation not detected")
         await shot(page, "10_unknown")
         return False
+
 
 # ---------------------------------------------------------------------------
 # Main session
 # ---------------------------------------------------------------------------
 
-async def run(debug: bool, skip_wait: bool, date_override: Optional[str] = None, time_override: Optional[str] = None) -> None:
+async def run(debug: bool, skip_wait: bool, force_pay: bool = False, date_override: Optional[str] = None, time_override: Optional[str] = None) -> None:
     global _SCREENSHOTS_ENABLED
     _SCREENSHOTS_ENABLED = debug
 
-    date         = date_override  if date_override  else target_date()
-    booking_time = time_override  if time_override  else BOOKING_TIME
+    # Sync with NTP before any time calculations so sleeps fire at true midnight.
+    sync_ntp()
+
+    date         = date_override or BOOKING_DATE or target_date()
+    booking_time = time_override or BOOKING_TIME
     midnight     = midnight_tonight()
     wait_secs    = secs_until(midnight)
 
-    log.info("=" * 55)
-    log.info(f"Target date    : {date}  at  {booking_time}")
-    if date_override or time_override:
-        log.info("Mode           : MANUAL OVERRIDE")
-    log.info(f"Booking opens  : {midnight.strftime('%Y-%m-%d %H:%M:%S %Z')}")
-    log.info(f"Time until open: {wait_secs / 3600:.2f} h  ({wait_secs:.0f} s)")
-    if debug:
-        log.info("Mode           : DEBUG (card details filled but Pay not clicked)")
-    log.info("=" * 55)
+    dry_run = debug and not force_pay
+    mode = "DRY-RUN" if dry_run else ("DEBUG+PAY" if debug else "LIVE")
+    log.info(f"=== {date} {booking_time} | opens {midnight.strftime('%H:%M:%S %Z')} | {mode} ===")
 
     # Sleep until PRE_LOGIN_SECS before midnight (unless skipping)
     if not skip_wait and not debug:
         sleep_time = max(0.0, wait_secs - PRE_LOGIN_SECS)
         if sleep_time > 0:
-            log.info(f"Sleeping {sleep_time:.0f} s  (waking {PRE_LOGIN_SECS}s before midnight) …")
+            log.info(f"Sleeping {sleep_time:.0f}s (wake {PRE_LOGIN_SECS}s before midnight)")
             await asyncio.sleep(sleep_time)
 
     async with async_playwright() as pw:
@@ -397,23 +501,43 @@ async def run(debug: bool, skip_wait: bool, date_override: Optional[str] = None,
         )
         page = await context.new_page()
 
+        # ── Network logging (debug only — helps discover API endpoints) ──
+        net_entries = []
+        if debug:
+            net_entries = attach_network_logger(page)
+            await attach_network_response_logger(page, net_entries)
+
         # ── Login ──
         if not await login(page):
             await browser.close()
             return
 
-        # ── Pre-load the booking page while waiting for midnight ──
+        # ── Block junk resources to speed up page loads ──
+        # Images, fonts, and analytics are irrelevant for booking.
+        # Fewer HTTP connections = faster slot data load at midnight.
+        if not debug:
+            for pattern in [
+                "**/*.{png,jpg,jpeg,gif,svg,ico,woff,woff2,ttf,eot}",
+                "**/google-analytics.com/**",
+                "**/googletagmanager.com/**",
+                "**/region1.google-analytics.com/**",
+            ]:
+                await page.route(pattern, lambda route: route.abort())
+
+        # ── Pre-load the booking page ──
         await goto_booking_page(page, date)
 
         # ── Wait for exact midnight ──
         if not skip_wait and not debug:
             remaining = secs_until(midnight)
             if remaining > 0:
-                log.info(f"Waiting final {remaining:.3f} s …")
-                await asyncio.sleep(remaining)
-            log.info(">>> MIDNIGHT — executing booking now! <<<")
-            await page.reload(wait_until="networkidle", timeout=20_000)
-            await asyncio.sleep(0.5)
+                log.info(f"Waiting {remaining:.1f}s")
+                if remaining > 0.2:
+                    await asyncio.sleep(remaining - 0.2)
+                while secs_until(midnight) > 0:
+                    pass  # spin-wait final 200ms for precision
+            log.info(">>> MIDNIGHT <<<")
+            await page.reload(wait_until="commit", timeout=10_000)
         else:
             log.info("Skipping midnight wait.")
 
@@ -428,7 +552,19 @@ async def run(debug: bool, skip_wait: bool, date_override: Optional[str] = None,
             return
 
         # ── Pay ──
-        await pay(page, debug=debug)
+        await pay(page, dry_run=dry_run)
+
+        # ── Save network log + cookies (debug only) ──
+        if debug:
+            save_network_log(net_entries)
+            try:
+                cookies = await context.cookies()
+                cookie_path = _HERE / "debug_cookies.json"
+                with open(cookie_path, "w") as f:
+                    _json.dump(cookies, f, indent=2)
+                log.info(f"Cookies saved → {cookie_path.name}  ({len(cookies)} cookies)")
+            except Exception as e:
+                log.warning(f"Could not save cookies: {e}")
 
         await browser.close()
 
@@ -440,11 +576,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Raynes Park tennis court booker")
     parser.add_argument(
         "--debug", action="store_true",
-        help="Take screenshots at each step but do NOT submit payment",
+        help="Enable screenshots and network logging. Stops before payment unless --pay is also set.",
     )
     parser.add_argument(
         "--now", action="store_true",
-        help="Skip the midnight wait — useful for testing with --debug",
+        help="Skip the midnight wait — run the booking flow immediately.",
     )
     parser.add_argument(
         "--date", default=None, metavar="YYYY-MM-DD",
@@ -454,10 +590,14 @@ if __name__ == "__main__":
         "--time", default=None, metavar="HH:MM",
         help="Override booking time (e.g. 09:00). Default: value from config.json.",
     )
+    parser.add_argument(
+        "--pay", action="store_true",
+        help="Actually submit payment (even in --debug mode). Use with --debug --now to book immediately.",
+    )
     args = parser.parse_args()
 
     if not USERNAME or not PASSWORD:
         log.error("BOOKING_USERNAME and BOOKING_PASSWORD must be set in .env")
         sys.exit(1)
 
-    asyncio.run(run(debug=args.debug, skip_wait=args.now, date_override=args.date, time_override=args.time))
+    asyncio.run(run(debug=args.debug, skip_wait=args.now, force_pay=args.pay, date_override=args.date, time_override=args.time))
