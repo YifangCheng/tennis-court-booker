@@ -528,12 +528,18 @@ async def run(debug: bool, skip_wait: bool, force_pay: bool = False, date_overri
         await goto_booking_page(page, date)
 
         # ── Wait for exact midnight ──
+        # Use short sleep intervals instead of one long sleep so that
+        # macOS power-nap / process suspension doesn't cause overshoot.
         if not skip_wait and not debug:
             remaining = secs_until(midnight)
             if remaining > 0:
                 log.info(f"Waiting {remaining:.1f}s")
-                if remaining > 0.2:
-                    await asyncio.sleep(remaining - 0.2)
+                while True:
+                    remaining = secs_until(midnight)
+                    if remaining <= 0.2:
+                        break
+                    # Sleep in 1s chunks, or less if we're close
+                    await asyncio.sleep(min(remaining - 0.2, 1.0))
                 while secs_until(midnight) > 0:
                     pass  # spin-wait final 200ms for precision
             log.info(">>> MIDNIGHT <<<")
