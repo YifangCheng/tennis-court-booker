@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
-"""Backward-compatible Raynes Park entrypoint."""
 
 import argparse
 import asyncio
 
 from shared.runtime import RunOptions
-from sites.raynes_park.site import RaynesParkSite
+from sites import build_registry
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Raynes Park tennis court booker")
+    registry = build_registry()
+    parser = argparse.ArgumentParser(description="Multi-site tennis court booker")
+    parser.add_argument(
+        "--site",
+        required=True,
+        choices=sorted(registry.keys()),
+        help="Booking site plugin to run.",
+    )
     parser.add_argument(
         "--debug",
         action="store_true",
@@ -24,24 +30,26 @@ def parse_args() -> argparse.Namespace:
         "--date",
         default=None,
         metavar="YYYY-MM-DD",
-        help="Override target date (e.g. 2026-03-04). Default: auto-calculated from tonight's midnight.",
+        help="Override target date. Default: site-specific booking window logic.",
     )
     parser.add_argument(
         "--time",
         default=None,
         metavar="HH:MM",
-        help="Override booking time (e.g. 09:00). Default: value from config.json.",
+        help="Override booking time. Default: value from the selected site's config.",
     )
     parser.add_argument(
         "--pay",
         action="store_true",
-        help="Actually submit payment (even in --debug mode). Use with --debug --now to book immediately.",
+        help="Actually submit payment, even in --debug mode.",
     )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    registry = build_registry()
+    site = registry[args.site]()
     options = RunOptions(
         debug=args.debug,
         skip_wait=args.now,
@@ -49,7 +57,7 @@ def main() -> None:
         date_override=args.date,
         time_override=args.time,
     )
-    asyncio.run(RaynesParkSite().run(options))
+    asyncio.run(site.run(options))
 
 
 if __name__ == "__main__":

@@ -3,13 +3,14 @@
 #   1. Wake from sleep at 23:57 tonight (via pmset)
 #   2. Run the booking script at 23:58 (via LaunchAgent)
 #
-# Usage: bash schedule.sh
+# Usage: bash schedule.sh --site SITE_NAME
 # To cancel: bash schedule.sh --uninstall
 
 set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PYTHON="$SCRIPT_DIR/venv/bin/python"
+PYTHON="$SCRIPT_DIR/.venv/bin/python"
 PLIST_PATH="$HOME/Library/LaunchAgents/com.tennis.booker.plist"
+SITE_NAME=""
 
 # ── Uninstall ────────────────────────────────────────────────────────────────
 if [[ "$1" == "--uninstall" ]]; then
@@ -21,9 +22,31 @@ if [[ "$1" == "--uninstall" ]]; then
     exit 0
 fi
 
+# ── Parse args ───────────────────────────────────────────────────────────────
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --site)
+            SITE_NAME="${2:-}"
+            shift 2
+            ;;
+        *)
+            echo "ERROR: Unknown argument: $1"
+            echo "Usage: bash schedule.sh --site SITE_NAME"
+            echo "       bash schedule.sh --uninstall"
+            exit 1
+            ;;
+    esac
+done
+
+if [[ -z "$SITE_NAME" ]]; then
+    echo "ERROR: Missing --site SITE_NAME"
+    echo "Usage: bash schedule.sh --site SITE_NAME"
+    exit 1
+fi
+
 # ── Validate ─────────────────────────────────────────────────────────────────
 if [ ! -f "$PYTHON" ]; then
-    echo "ERROR: venv not found. Run 'bash setup.sh' first."
+    echo "ERROR: .venv not found. Run 'bash setup.sh' first."
     exit 1
 fi
 
@@ -55,7 +78,9 @@ cat > "$PLIST_PATH" << PLIST
     <key>ProgramArguments</key>
     <array>
         <string>$PYTHON</string>
-        <string>$SCRIPT_DIR/booker.py</string>
+        <string>$SCRIPT_DIR/main.py</string>
+        <string>--site</string>
+        <string>$SITE_NAME</string>
     </array>
 
     <!-- Run at 23:58 every night -->
@@ -74,7 +99,7 @@ cat > "$PLIST_PATH" << PLIST
     <key>StandardErrorPath</key>
     <string>$SCRIPT_DIR/booker_error.log</string>
 
-    <!-- Keep HOME so python-dotenv can find the .env file -->
+    <!-- Keep HOME for the Python process environment -->
     <key>EnvironmentVariables</key>
     <dict>
         <key>HOME</key>
@@ -92,6 +117,8 @@ echo "LaunchAgent loaded."
 # ── Summary ──────────────────────────────────────────────────────────────────
 echo ""
 echo "=== All done! ==="
+echo ""
+echo "Scheduled site: $SITE_NAME"
 echo ""
 echo "Tonight:"
 echo "  23:57 — Mac wakes from sleep"
