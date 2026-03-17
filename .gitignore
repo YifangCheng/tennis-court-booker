@@ -212,3 +212,4 @@ __marimo__/
 screenshots/
 booker.log
 booker_error.log
+.tmp/
