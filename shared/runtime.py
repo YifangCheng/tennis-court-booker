@@ -17,6 +17,11 @@ def load_root_env() -> None:
     load_dotenv(ROOT / ".env")
 
 
+def ensure_runtime_dirs() -> None:
+    (ROOT / "logs").mkdir(parents=True, exist_ok=True)
+    (ROOT / "screenshots").mkdir(parents=True, exist_ok=True)
+
+
 def get_logger() -> logging.Logger:
     if not logging.getLogger().handlers:
         logging.basicConfig(

@@ -3,7 +3,7 @@
 import argparse
 import asyncio
 
-from shared.runtime import RunOptions
+from shared.runtime import RunOptions, ensure_runtime_dirs
 from sites import build_registry
 
 
@@ -48,6 +48,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    ensure_runtime_dirs()
     registry = build_registry()
     site = registry[args.site]()
     options = RunOptions(

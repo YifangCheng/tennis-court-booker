@@ -210,7 +210,8 @@ __marimo__/
 
 # Tennis booker
 screenshots/
-booker.log
-booker_error.log
+logs/*.log
+network_log*.json
+debug_cookies*.json
 .tmp/
-yifang/
+.DS_Store

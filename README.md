@@ -5,7 +5,7 @@ This repository automates tennis court booking across multiple websites using a 
 ## Setup
 
 ```bash
-bash setup.sh          # creates venv, installs dependencies, copies .env.example -> .env
+bash setup.sh          # creates .venv, installs dependencies, copies .env.example -> .env
 ```
 
 Then edit `.env`:
@@ -13,6 +13,8 @@ Then edit `.env`:
 ```
 RAYNES_PARK_BOOKING_USERNAME=your_email@example.com
 RAYNES_PARK_BOOKING_PASSWORD=your_password
+CLUB_SPARK_BOOKING_USERNAME=your_clubspark_username
+CLUB_SPARK_BOOKING_PASSWORD=your_clubspark_password
 CARD_NUMBER=1234567890123456
 CARD_EXPIRY=12/27
 CARD_CVV=123
@@ -21,7 +23,7 @@ CARD_NAME=Your Full Name
 
 ## Configuration
 
-Each site keeps its own runtime defaults. For Raynes Park, edit `sites/raynes_park/config.json` before your first real run.
+Each site keeps its own runtime defaults. Edit the config file for the site you want to run, for example `sites/raynes_park/config.json` or `sites/club_spark/config.json`.
 
 ```json
 {
@@ -45,7 +47,7 @@ Login credentials are site-specific by variable name inside `.env`. Payment fiel
 
 ## Scheduled run (sleep through it)
 
-Makes your Mac wake from sleep at 23:57 and run the script automatically at 23:58.
+Makes your Mac wake from sleep shortly before the selected site's release window and start the booking script at that site's pre-login time.
 
 **Requirements:** MacBook must be plugged in to power (lid can be closed).
 
@@ -65,4 +67,5 @@ bash schedule.sh --uninstall
 
 Each plugin can keep its own operational and development notes.
 
+- Club Spark: [`sites/club_spark/README.md`](/Users/yifang/PycharmProjects/tennis-court-booker/sites/club_spark/README.md)
 - Raynes Park: [`sites/raynes_park/README.md`](/Users/yifang/PycharmProjects/tennis-court-booker/sites/raynes_park/README.md)

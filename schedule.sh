@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Schedules your Mac to:
-#   1. Wake from sleep at 23:57 tonight (via pmset)
-#   2. Run the booking script at 23:58 (via LaunchAgent)
+#   1. Wake from sleep shortly before the configured site release time (via pmset)
+#   2. Run the booking script at the site's pre-login time (via LaunchAgent)
 #
 # Usage: bash schedule.sh --site SITE_NAME
 # To cancel: bash schedule.sh --uninstall
@@ -11,6 +11,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON="$SCRIPT_DIR/.venv/bin/python"
 PLIST_PATH="$HOME/Library/LaunchAgents/com.tennis.booker.plist"
 SITE_NAME=""
+LOG_DIR="$SCRIPT_DIR/logs"
 
 # ── Uninstall ────────────────────────────────────────────────────────────────
 if [[ "$1" == "--uninstall" ]]; then
@@ -55,11 +56,57 @@ if [ ! -f "$SCRIPT_DIR/.env" ]; then
     exit 1
 fi
 
-# ── 1. Schedule Mac wake at 23:57 tonight ───────────────────────────────────
-TONIGHT=$(date "+%m/%d/%Y")
-echo "Scheduling Mac wake at 23:57:00 on $TONIGHT …"
+mkdir -p "$LOG_DIR"
+
+CONFIG_PATH="$SCRIPT_DIR/sites/$SITE_NAME/config.json"
+if [ ! -f "$CONFIG_PATH" ]; then
+    echo "ERROR: config not found for site '$SITE_NAME' at $CONFIG_PATH"
+    exit 1
+fi
+
+SCHEDULE_INFO=$("$PYTHON" - "$CONFIG_PATH" <<'PY'
+import json
+import sys
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+config_path = sys.argv[1]
+with open(config_path) as handle:
+    config = json.load(handle)
+
+timezone = ZoneInfo(config.get("timezone", "Europe/London"))
+pre_login_seconds = int(config.get("pre_login_seconds", 120))
+release_hour = int(config.get("release_hour", 0))
+release_minute = int(config.get("release_minute", 0))
+
+now = datetime.now(timezone)
+release = now.replace(hour=release_hour, minute=release_minute, second=0, microsecond=0)
+if release <= now:
+    release += timedelta(days=1)
+
+start = release - timedelta(seconds=pre_login_seconds)
+wake = start - timedelta(minutes=1)
+
+print(wake.strftime("%m/%d/%Y"))
+print(wake.strftime("%H:%M:%S"))
+print(start.strftime("%H"))
+print(start.strftime("%M"))
+print(start.strftime("%H:%M"))
+print(release.strftime("%H:%M"))
+PY
+)
+
+WAKE_DATE=$(printf '%s\n' "$SCHEDULE_INFO" | sed -n '1p')
+WAKE_TIME=$(printf '%s\n' "$SCHEDULE_INFO" | sed -n '2p')
+START_HOUR=$(printf '%s\n' "$SCHEDULE_INFO" | sed -n '3p')
+START_MINUTE=$(printf '%s\n' "$SCHEDULE_INFO" | sed -n '4p')
+START_TIME=$(printf '%s\n' "$SCHEDULE_INFO" | sed -n '5p')
+RELEASE_TIME=$(printf '%s\n' "$SCHEDULE_INFO" | sed -n '6p')
+
+# ── 1. Schedule Mac wake before the configured release window ───────────────
+echo "Scheduling Mac wake at $WAKE_TIME on $WAKE_DATE …"
 echo "(You may be prompted for your Mac password — this is for pmset)"
-sudo pmset schedule wake "$TONIGHT 23:57:00"
+sudo pmset schedule wake "$WAKE_DATE $WAKE_TIME"
 echo "Wake scheduled."
 
 # ── 2. Install LaunchAgent (runs at 23:58 every night) ───────────────────────
@@ -83,21 +130,21 @@ cat > "$PLIST_PATH" << PLIST
         <string>$SITE_NAME</string>
     </array>
 
-    <!-- Run at 23:58 every night -->
+    <!-- Run daily at the site's configured pre-login time -->
     <key>StartCalendarInterval</key>
     <dict>
-        <key>Hour</key>   <integer>23</integer>
-        <key>Minute</key> <integer>58</integer>
+        <key>Hour</key>   <integer>$START_HOUR</integer>
+        <key>Minute</key> <integer>$START_MINUTE</integer>
     </dict>
 
     <key>WorkingDirectory</key>
     <string>$SCRIPT_DIR</string>
 
     <key>StandardOutPath</key>
-    <string>$SCRIPT_DIR/booker.log</string>
+    <string>$LOG_DIR/booker.log</string>
 
     <key>StandardErrorPath</key>
-    <string>$SCRIPT_DIR/booker_error.log</string>
+    <string>$LOG_DIR/booker_error.log</string>
 
     <!-- Keep HOME for the Python process environment -->
     <key>EnvironmentVariables</key>
@@ -121,11 +168,11 @@ echo ""
 echo "Scheduled site: $SITE_NAME"
 echo ""
 echo "Tonight:"
-echo "  23:57 — Mac wakes from sleep"
-echo "  23:58 — Booking script starts, logs in, pre-loads the page"
-echo "  00:00 — Script fires the booking at exactly midnight"
+echo "  Wake: $WAKE_TIME"
+echo "  Start: $START_TIME"
+echo "  Release: $RELEASE_TIME"
 echo ""
-echo "Logs: $SCRIPT_DIR/booker.log"
+echo "Logs: $LOG_DIR/booker.log"
 echo "Screenshots: $SCRIPT_DIR/screenshots/"
 echo ""
 echo "IMPORTANT — keep your Mac:"

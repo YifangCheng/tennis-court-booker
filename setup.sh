@@ -10,8 +10,8 @@ echo "=== Tennis Court Booker — Setup ==="
 # Create virtual environment
 echo ""
 echo "1. Creating virtual environment …"
-python3 -m .venv ..venv
-source ..venv/bin/activate
+python3 -m venv .venv
+source .venv/bin/activate
 
 # Install Python packages
 echo ""

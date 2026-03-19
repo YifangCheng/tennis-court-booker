@@ -1,11 +1,11 @@
 {
   "booking_date": null,
-  "booking_time": "17:00",
-  "preferred_courts": [6],
-  "court_type": "indoor",
+  "booking_time": "10:00",
+  "booking_duration_minutes": 60,
+  "preferred_courts": [3],
   "timezone": "Europe/London",
   "headless": true,
   "pre_login_seconds": 120,
-  "release_hour": 0,
+  "release_hour": 20,
   "release_minute": 0
 }
