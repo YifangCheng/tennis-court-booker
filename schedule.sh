@@ -3,23 +3,27 @@
 #   1. Wake from sleep shortly before the configured site release time (via pmset)
 #   2. Run the booking script at the site's pre-login time (via LaunchAgent)
 #
-# Usage: bash schedule.sh --site SITE_NAME
+# Usage: bash schedule.sh --site SITE_NAME [--account ACCOUNT_NAME] [--time HH:MM]
 # To cancel: bash schedule.sh --uninstall
 
 set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON="$SCRIPT_DIR/.venv/bin/python"
-PLIST_PATH="$HOME/Library/LaunchAgents/com.tennis.booker.plist"
 SITE_NAME=""
+ACCOUNT_NAME=""
+BOOKING_TIME=""
 LOG_DIR="$SCRIPT_DIR/logs"
 
 # ── Uninstall ────────────────────────────────────────────────────────────────
 if [[ "$1" == "--uninstall" ]]; then
-    echo "Uninstalling LaunchAgent …"
-    launchctl unload "$PLIST_PATH" 2>/dev/null || true
-    rm -f "$PLIST_PATH"
+    echo "Uninstalling LaunchAgents …"
+    for plist in "$HOME"/Library/LaunchAgents/com.tennis.booker*.plist; do
+        [ -e "$plist" ] || continue
+        launchctl unload "$plist" 2>/dev/null || true
+        rm -f "$plist"
+    done
     sudo pmset schedule cancelall 2>/dev/null || true
-    echo "Done. LaunchAgent and scheduled wake removed."
+    echo "Done. LaunchAgents and scheduled wake removed."
     exit 0
 fi
 
@@ -30,9 +34,17 @@ while [[ $# -gt 0 ]]; do
             SITE_NAME="${2:-}"
             shift 2
             ;;
+        --account)
+            ACCOUNT_NAME="${2:-}"
+            shift 2
+            ;;
+        --time)
+            BOOKING_TIME="${2:-}"
+            shift 2
+            ;;
         *)
             echo "ERROR: Unknown argument: $1"
-            echo "Usage: bash schedule.sh --site SITE_NAME"
+            echo "Usage: bash schedule.sh --site SITE_NAME [--account ACCOUNT_NAME] [--time HH:MM]"
             echo "       bash schedule.sh --uninstall"
             exit 1
             ;;
@@ -41,9 +53,39 @@ done
 
 if [[ -z "$SITE_NAME" ]]; then
     echo "ERROR: Missing --site SITE_NAME"
-    echo "Usage: bash schedule.sh --site SITE_NAME"
+    echo "Usage: bash schedule.sh --site SITE_NAME [--account ACCOUNT_NAME] [--time HH:MM]"
     exit 1
 fi
+
+LABEL_SUFFIX="$SITE_NAME"
+LOG_SUFFIX="$SITE_NAME"
+PROGRAM_ACCOUNT_ARGS=""
+PROGRAM_TIME_ARGS=""
+if [[ -n "$ACCOUNT_NAME" ]]; then
+    SAFE_ACCOUNT_NAME="${ACCOUNT_NAME//[^A-Za-z0-9_-]/_}"
+    LABEL_SUFFIX="${SITE_NAME}.${SAFE_ACCOUNT_NAME}"
+    LOG_SUFFIX="${SITE_NAME}_${SAFE_ACCOUNT_NAME}"
+    PROGRAM_ACCOUNT_ARGS=$(cat <<EOF
+        <string>--account</string>
+        <string>$ACCOUNT_NAME</string>
+EOF
+)
+fi
+
+if [[ -n "$BOOKING_TIME" ]]; then
+    SAFE_BOOKING_TIME="${BOOKING_TIME//:/-}"
+    LABEL_SUFFIX="${LABEL_SUFFIX}.${SAFE_BOOKING_TIME}"
+    LOG_SUFFIX="${LOG_SUFFIX}_${SAFE_BOOKING_TIME}"
+    PROGRAM_TIME_ARGS=$(cat <<EOF
+        <string>--time</string>
+        <string>$BOOKING_TIME</string>
+EOF
+)
+fi
+
+PLIST_PATH="$HOME/Library/LaunchAgents/com.tennis.booker.${LABEL_SUFFIX}.plist"
+STDOUT_LOG="$LOG_DIR/booker_${LOG_SUFFIX}.log"
+STDERR_LOG="$LOG_DIR/booker_${LOG_SUFFIX}_error.log"
 
 # ── Validate ─────────────────────────────────────────────────────────────────
 if [ ! -f "$PYTHON" ]; then
@@ -120,7 +162,7 @@ cat > "$PLIST_PATH" << PLIST
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.tennis.booker</string>
+    <string>com.tennis.booker.$LABEL_SUFFIX</string>
 
     <key>ProgramArguments</key>
     <array>
@@ -128,6 +170,8 @@ cat > "$PLIST_PATH" << PLIST
         <string>$SCRIPT_DIR/main.py</string>
         <string>--site</string>
         <string>$SITE_NAME</string>
+$PROGRAM_ACCOUNT_ARGS
+$PROGRAM_TIME_ARGS
     </array>
 
     <!-- Run daily at the site's configured pre-login time -->
@@ -141,10 +185,10 @@ cat > "$PLIST_PATH" << PLIST
     <string>$SCRIPT_DIR</string>
 
     <key>StandardOutPath</key>
-    <string>$LOG_DIR/booker.log</string>
+    <string>$STDOUT_LOG</string>
 
     <key>StandardErrorPath</key>
-    <string>$LOG_DIR/booker_error.log</string>
+    <string>$STDERR_LOG</string>
 
     <!-- Keep HOME for the Python process environment -->
     <key>EnvironmentVariables</key>
@@ -166,13 +210,19 @@ echo ""
 echo "=== All done! ==="
 echo ""
 echo "Scheduled site: $SITE_NAME"
+if [[ -n "$ACCOUNT_NAME" ]]; then
+    echo "Scheduled account: $ACCOUNT_NAME"
+fi
+if [[ -n "$BOOKING_TIME" ]]; then
+    echo "Scheduled booking time override: $BOOKING_TIME"
+fi
 echo ""
 echo "Tonight:"
 echo "  Wake: $WAKE_TIME"
 echo "  Start: $START_TIME"
 echo "  Release: $RELEASE_TIME"
 echo ""
-echo "Logs: $LOG_DIR/booker.log"
+echo "Logs: $STDOUT_LOG"
 echo "Screenshots: $SCRIPT_DIR/screenshots/"
 echo ""
 echo "IMPORTANT — keep your Mac:"

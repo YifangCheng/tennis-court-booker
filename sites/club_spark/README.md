@@ -7,7 +7,11 @@ This plugin targets Tanner St Park on ClubSpark. It uses a safer hybrid flow: pr
 ```bash
 python main.py --site club_spark --debug --now --date 2026-03-24 --time 10:00
 python main.py --site club_spark --debug --now --pay --date 2026-03-24 --time 10:00
+python main.py --site club_spark --account a --pay --date 2026-03-27 --time 10:00
+python main.py --site club_spark --account b --pay --date 2026-03-27 --time 11:00
 python main.py --site club_spark
+bash schedule.sh --site club_spark --account a --time 10:00
+bash schedule.sh --site club_spark --account b --time 11:00
 ```
 
 ## Booking Rules
@@ -16,6 +20,8 @@ python main.py --site club_spark
 - Booking window: `7 days in advance`
 - Default duration: `60 minutes`
 - Court priority comes from `preferred_courts` in `sites/club_spark/config.json`
+- Account `a` is the implicit default, and `--account` selects `CLUB_SPARK_<ACCOUNT>_BOOKING_USERNAME` / `...PASSWORD`
+- `--time HH:MM` can override `booking_time` for a scheduled or manual run
 
 Without `--date`, the plugin targets `today + 7 days`, which matches the site's release rule. For example, if today is Tuesday, it targets next Tuesday.
 

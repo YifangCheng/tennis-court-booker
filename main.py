@@ -43,6 +43,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Actually submit payment, even in --debug mode.",
     )
+    parser.add_argument(
+        "--account",
+        default=None,
+        help="Optional account name for sites that support multiple login pairs, for example 'a' or 'secondary'.",
+    )
     return parser.parse_args()
 
 
@@ -57,6 +62,7 @@ def main() -> None:
         force_pay=args.pay,
         date_override=args.date,
         time_override=args.time,
+        account_override=args.account,
     )
     asyncio.run(site.run(options))
 

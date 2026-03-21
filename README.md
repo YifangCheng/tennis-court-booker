@@ -13,13 +13,17 @@ Then edit `.env`:
 ```
 RAYNES_PARK_BOOKING_USERNAME=your_email@example.com
 RAYNES_PARK_BOOKING_PASSWORD=your_password
-CLUB_SPARK_BOOKING_USERNAME=your_clubspark_username
-CLUB_SPARK_BOOKING_PASSWORD=your_clubspark_password
+CLUB_SPARK_A_BOOKING_USERNAME=your_primary_clubspark_username
+CLUB_SPARK_A_BOOKING_PASSWORD=your_primary_clubspark_password
+CLUB_SPARK_B_BOOKING_USERNAME=your_secondary_clubspark_username
+CLUB_SPARK_B_BOOKING_PASSWORD=your_secondary_clubspark_password
 CARD_NUMBER=1234567890123456
 CARD_EXPIRY=12/27
 CARD_CVV=123
 CARD_NAME=Your Full Name
 ```
+
+For ClubSpark, account `a` is the default if you omit `--account`. For example, `python main.py --site club_spark ...` uses `CLUB_SPARK_A_BOOKING_USERNAME` / `CLUB_SPARK_A_BOOKING_PASSWORD`, while `--account b` uses the `B` pair.
 
 ## Configuration
 
@@ -53,9 +57,11 @@ Makes your Mac wake from sleep shortly before the selected site's release window
 
 ```bash
 bash schedule.sh --site raynes_park
+bash schedule.sh --site club_spark --account a --time 10:00
+bash schedule.sh --site club_spark --account b --time 11:00
 ```
 
-Pass the target plugin explicitly. For example, if you later add `clubspark_wimbledon`, schedule it with `bash schedule.sh --site clubspark_wimbledon`.
+Pass the target plugin explicitly. For example, if you later add `clubspark_wimbledon`, schedule it with `bash schedule.sh --site clubspark_wimbledon`. For ClubSpark, `--account a` and `--account b` install separate LaunchAgents and separate log files, and `--time HH:MM` overrides the booking hour for that scheduled job while court priority still comes from the site config.
 
 To cancel:
 

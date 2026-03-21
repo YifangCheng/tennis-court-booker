@@ -2,7 +2,7 @@
   "booking_date": null,
   "booking_time": "10:00",
   "booking_duration_minutes": 60,
-  "preferred_courts": [3],
+  "preferred_courts": [2],
   "timezone": "Europe/London",
   "headless": true,
   "pre_login_seconds": 120,

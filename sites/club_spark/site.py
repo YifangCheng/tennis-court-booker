@@ -3,9 +3,11 @@ import json as _json
 import os
 from datetime import datetime, timedelta
 from pathlib import Path
+from time import monotonic
 from typing import Optional
 
 import pytz
+from playwright._impl._errors import TargetClosedError
 from playwright.async_api import Page, async_playwright
 
 from shared.runtime import ROOT, RunOptions, TimingHelper, get_logger, load_json, load_root_env
@@ -42,20 +44,30 @@ class ClubSparkSite(BookingSite):
         self.release_hour = int(cfg.get("release_hour", 20))
         self.release_minute = int(cfg.get("release_minute", 0))
 
-        self.username = os.environ.get(f"{self.env_prefix}_BOOKING_USERNAME", "")
-        self.password = os.environ.get(f"{self.env_prefix}_BOOKING_PASSWORD", "")
         self.card_number = os.environ.get("CARD_NUMBER", "")
         self.card_expiry = os.environ.get("CARD_EXPIRY", "")
         self.card_cvv = os.environ.get("CARD_CVV", "")
 
         self.base_url = "https://clubspark.lta.org.uk/TannerStPark"
         self.api_base_url = "https://clubspark.lta.org.uk"
+        self.account_name = "a"
+        self.username = ""
+        self.password = ""
+
+    def configure_account(self, account_override: Optional[str]) -> None:
+        account = (account_override or self.cfg.get("account") or "a").strip()
+        normalized = account.upper().replace("-", "_")
+        username_key = f"{self.env_prefix}_{normalized}_BOOKING_USERNAME"
+        password_key = f"{self.env_prefix}_{normalized}_BOOKING_PASSWORD"
+        self.username = os.environ.get(username_key, "")
+        self.password = os.environ.get(password_key, "")
+        self.account_name = account
+        self._username_env_key = username_key
+        self._password_env_key = password_key
 
     def validate_environment(self) -> None:
         if not self.username or not self.password:
-            raise SystemExit(
-                f"{self.env_prefix}_BOOKING_USERNAME and {self.env_prefix}_BOOKING_PASSWORD must be set in .env"
-            )
+            raise SystemExit(f"{self._username_env_key} and {self._password_env_key} must be set in .env")
 
     def booking_url_for(self, date: str) -> str:
         return f"{self.base_url}/Booking/BookByDate#?date={date}&role=guest"
@@ -133,13 +145,15 @@ class ClubSparkSite(BookingSite):
 
     async def attach_network_response_logger(self, page: Page, entries: list) -> None:
         async def _on_response(response) -> None:
-            req = response.request
-            is_xhr = req.resource_type in ("xhr", "fetch")
-            is_post_doc = req.resource_type == "document" and req.method != "GET"
-            if not (is_xhr or is_post_doc):
-                return
             try:
+                req = response.request
+                is_xhr = req.resource_type in ("xhr", "fetch")
+                is_post_doc = req.resource_type == "document" and req.method != "GET"
+                if not (is_xhr or is_post_doc):
+                    return
                 body = await response.text()
+            except TargetClosedError:
+                return
             except Exception:
                 body = "<could not read body>"
             for entry in reversed(entries):
@@ -396,11 +410,156 @@ class ClubSparkSite(BookingSite):
             log.error("'Continue booking' not found")
             return False
 
-        async with page.expect_navigation(timeout=20_000):
-            await page.click("#submit-booking")
+        await page.click("#submit-booking")
         log.info("Continue booking clicked")
+
+        try:
+            await page.wait_for_selector("#paynow", timeout=20_000)
+        except Exception:
+            try:
+                await page.wait_for_url("**/Booking/Book**", timeout=5_000)
+                await page.wait_for_selector("#paynow", timeout=15_000)
+            except Exception as exc:
+                log.error(f"Booking confirmation did not appear after Continue booking: {exc}")
+                await self.shot(page, "club_09_confirmation_error", full_page=False)
+                return False
+
         await self.shot(page, "club_09_booking_confirmation")
         return True
+
+    async def payment_state(self, page: Page) -> tuple[str, str]:
+        confirmation_selector = (
+            "h1:has-text('Confirmed'), h2:has-text('Confirmed'), "
+            "h1:has-text('Thank you'), p:has-text('successfully booked'), "
+            ".booking-confirmed, .alert-success"
+        )
+        stripe_selector = (
+            'iframe[title="Secure card number input frame"], '
+            'iframe[title="Secure expiration date input frame"], '
+            'iframe[title="Secure CVC input frame"]'
+        )
+        loading_selector = (
+            ".loading, .spinner, .loading-spinner, .cs-loading, .blockUI, "
+            "[aria-busy='true'], [data-testid*='loading']"
+        )
+        paynow = page.locator("#paynow").first
+        try:
+            if await page.locator(confirmation_selector).first.is_visible(timeout=250):
+                return "confirmed", "confirmation page visible"
+        except Exception:
+            pass
+        try:
+            if await page.locator(stripe_selector).first.is_visible(timeout=250):
+                return "stripe_ready", "stripe iframe visible"
+        except Exception:
+            pass
+        fatal_texts = [
+            "something went wrong",
+            "payment failed",
+            "unable to process",
+            "session expired",
+            "try again later",
+            "technical issue",
+            "error",
+        ]
+        try:
+            body_text = (await page.locator("body").inner_text(timeout=500)).lower()
+        except Exception:
+            body_text = ""
+        for text in fatal_texts:
+            if text in body_text:
+                return "fatal_error", text
+        try:
+            if await page.locator(loading_selector).first.is_visible(timeout=250):
+                return "loading", "visible loading indicator"
+        except Exception:
+            pass
+        if any(text in body_text for text in ["loading", "processing", "please wait", "creating payment"]):
+            return "loading", "page text indicates payment is still loading"
+        try:
+            if await paynow.is_visible(timeout=250):
+                disabled = await paynow.get_attribute("disabled")
+                if disabled is not None:
+                    return "loading", "confirm and pay button is disabled"
+                return "paynow_visible", "confirm and pay button still visible"
+        except Exception:
+            pass
+        return "waiting", "payment session pending"
+
+    async def wait_for_payment_ready(self, page: Page) -> str:
+        deadline = monotonic() + 180
+        last_log_at = 0.0
+        retried_paynow = False
+        paynow = page.locator("#paynow").first
+        while monotonic() < deadline:
+            state, detail = await self.payment_state(page)
+            now = monotonic()
+            if state == "stripe_ready":
+                log.info("Stripe session ready")
+                return "stripe_ready"
+            if state == "confirmed":
+                log.info("Booking confirmed before Stripe form appeared")
+                return "confirmed"
+            if state == "fatal_error":
+                log.error(f"Payment page reported an error: {detail}")
+                await self.shot(page, "club_10_payment_error", full_page=False)
+                return "fatal_error"
+            if state == "paynow_visible" and not retried_paynow and now + 30 < deadline:
+                try:
+                    await paynow.click(force=True, timeout=5_000)
+                    retried_paynow = True
+                    log.warning("Payment session did not advance; retried Confirm and pay once")
+                except Exception as exc:
+                    log.warning(f"Could not retry Confirm and pay: {exc}")
+            if now - last_log_at >= 5:
+                log.info(f"Waiting for payment session: {state} ({detail})")
+                last_log_at = now
+            await asyncio.sleep(0.5)
+        try:
+            url = page.url
+        except Exception:
+            url = "<unavailable>"
+        try:
+            body = (await page.locator("body").inner_text(timeout=1_000))[:400].replace("\n", " ")
+        except Exception:
+            body = "<could not read page text>"
+        log.error(f"Payment session timed out after prolonged wait. url={url} body={body}")
+        await self.shot(page, "club_10_payment_timeout", full_page=False)
+        return "timeout"
+
+    async def wait_for_booking_confirmation(self, page: Page) -> bool:
+        deadline = monotonic() + 120
+        confirmation_selector = (
+            "h1:has-text('Confirmed'), h2:has-text('Confirmed'), "
+            "h1:has-text('Thank you'), p:has-text('successfully booked'), "
+            ".booking-confirmed, .alert-success"
+        )
+        fatal_texts = ["payment failed", "something went wrong", "technical issue", "error"]
+        last_log_at = 0.0
+        while monotonic() < deadline:
+            try:
+                if await page.locator(confirmation_selector).first.is_visible(timeout=250):
+                    log.info("BOOKING CONFIRMED!")
+                    return True
+            except Exception:
+                pass
+            try:
+                body_text = (await page.locator("body").inner_text(timeout=500)).lower()
+            except Exception:
+                body_text = ""
+            for text in fatal_texts:
+                if text in body_text:
+                    log.error(f"Confirmation page reported an error: {text}")
+                    await self.shot(page, "club_12_confirmation_error", full_page=False)
+                    return False
+            now = monotonic()
+            if now - last_log_at >= 5:
+                log.info("Waiting for final booking confirmation")
+                last_log_at = now
+            await asyncio.sleep(0.5)
+        log.error("Confirmation not detected before timeout")
+        await self.shot(page, "club_12_unknown")
+        return False
 
     async def pay(self, page: Page, dry_run: bool) -> bool:
         try:
@@ -412,10 +571,10 @@ class ClubSparkSite(BookingSite):
             await self.shot(page, "club_10_pay_error", full_page=False)
             return False
 
-        try:
-            await page.wait_for_selector('iframe[title="Secure card number input frame"]', timeout=10_000)
-        except Exception as exc:
-            log.error(f"Stripe form not found: {exc}")
+        payment_state = await self.wait_for_payment_ready(page)
+        if payment_state == "confirmed":
+            return True
+        if payment_state != "stripe_ready":
             return False
 
         if not self.card_number:
@@ -462,21 +621,10 @@ class ClubSparkSite(BookingSite):
             log.error(f"Pay button failed: {exc}")
             return False
 
-        try:
-            await page.wait_for_selector(
-                "h1:has-text('Confirmed'), h2:has-text('Confirmed'), "
-                "h1:has-text('Thank you'), p:has-text('successfully booked'), "
-                ".booking-confirmed, .alert-success",
-                timeout=20_000,
-            )
-            log.info("BOOKING CONFIRMED!")
-            return True
-        except Exception:
-            log.error("Confirmation not detected")
-            await self.shot(page, "club_12_unknown")
-            return False
+        return await self.wait_for_booking_confirmation(page)
 
     async def run(self, options: RunOptions) -> None:
+        self.configure_account(options.account_override)
         self.validate_environment()
         self._screenshots_enabled = options.debug
 
@@ -491,7 +639,8 @@ class ClubSparkSite(BookingSite):
         dry_run = options.debug and not options.force_pay
         mode = "DRY-RUN" if dry_run else ("DEBUG+PAY" if options.debug else "LIVE")
         log.info(
-            f"=== {self.name} | {date} {booking_time} | opens {release_time.strftime('%H:%M:%S %Z')} | {mode} ==="
+            f"=== {self.name} | account={self.account_name} | {date} {booking_time} | "
+            f"opens {release_time.strftime('%H:%M:%S %Z')} | {mode} ==="
         )
 
         if not options.skip_wait and not options.debug:
