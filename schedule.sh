@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Schedules your Mac to:
-#   1. Wake from sleep shortly before the configured site release time (via pmset)
+#   1. Wake from sleep shortly before the site's booking-open time (via pmset)
 #   2. Run the booking script at the site's pre-login time (via LaunchAgent)
 #
 # Usage: bash schedule.sh --site SITE_NAME [--account ACCOUNT_NAME] [--venue VENUE_SLUG] [--time HH:MM] [--court N]
@@ -179,7 +179,7 @@ START_MINUTE=$(printf '%s\n' "$SCHEDULE_INFO" | sed -n '4p')
 START_TIME=$(printf '%s\n' "$SCHEDULE_INFO" | sed -n '5p')
 RELEASE_TIME=$(printf '%s\n' "$SCHEDULE_INFO" | sed -n '6p')
 
-# ── 1. Schedule Mac wake before the configured release window ───────────────
+# ── 1. Schedule Mac wake before the booking-open window ─────────────────────
 echo "Scheduling Mac wake at $WAKE_TIME on $WAKE_DATE …"
 echo "(You may be prompted for your Mac password — this is for pmset)"
 sudo pmset schedule wake "$WAKE_DATE $WAKE_TIME"
@@ -264,7 +264,7 @@ echo ""
 echo "Tonight:"
 echo "  Wake: $WAKE_TIME"
 echo "  Start: $START_TIME"
-echo "  Release: $RELEASE_TIME"
+echo "  Booking Opens: $RELEASE_TIME"
 echo ""
 echo "Logs: $STDOUT_LOG"
 echo "Screenshots: $SCRIPT_DIR/screenshots/"
