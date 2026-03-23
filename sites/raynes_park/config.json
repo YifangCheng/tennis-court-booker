@@ -6,6 +6,5 @@
   "timezone": "Europe/London",
   "headless": true,
   "pre_login_seconds": 120,
-  "release_hour": 0,
-  "release_minute": 0
+  "booking_open_time": "00:00"
 }

@@ -3,15 +3,18 @@
 #   1. Wake from sleep shortly before the configured site release time (via pmset)
 #   2. Run the booking script at the site's pre-login time (via LaunchAgent)
 #
-# Usage: bash schedule.sh --site SITE_NAME [--account ACCOUNT_NAME] [--time HH:MM]
+# Usage: bash schedule.sh --site SITE_NAME [--account ACCOUNT_NAME] [--venue VENUE_SLUG] [--time HH:MM] [--court N]
 # To cancel: bash schedule.sh --uninstall
 
 set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON="$SCRIPT_DIR/.venv/bin/python"
+CAFFEINATE="/usr/bin/caffeinate"
 SITE_NAME=""
 ACCOUNT_NAME=""
+VENUE_NAME=""
 BOOKING_TIME=""
+COURT_NUMBER=""
 LOG_DIR="$SCRIPT_DIR/logs"
 
 # ── Uninstall ────────────────────────────────────────────────────────────────
@@ -38,13 +41,21 @@ while [[ $# -gt 0 ]]; do
             ACCOUNT_NAME="${2:-}"
             shift 2
             ;;
+        --venue)
+            VENUE_NAME="${2:-}"
+            shift 2
+            ;;
         --time)
             BOOKING_TIME="${2:-}"
             shift 2
             ;;
+        --court)
+            COURT_NUMBER="${2:-}"
+            shift 2
+            ;;
         *)
             echo "ERROR: Unknown argument: $1"
-            echo "Usage: bash schedule.sh --site SITE_NAME [--account ACCOUNT_NAME] [--time HH:MM]"
+            echo "Usage: bash schedule.sh --site SITE_NAME [--account ACCOUNT_NAME] [--venue VENUE_SLUG] [--time HH:MM] [--court N]"
             echo "       bash schedule.sh --uninstall"
             exit 1
             ;;
@@ -53,14 +64,16 @@ done
 
 if [[ -z "$SITE_NAME" ]]; then
     echo "ERROR: Missing --site SITE_NAME"
-    echo "Usage: bash schedule.sh --site SITE_NAME [--account ACCOUNT_NAME] [--time HH:MM]"
+    echo "Usage: bash schedule.sh --site SITE_NAME [--account ACCOUNT_NAME] [--venue VENUE_SLUG] [--time HH:MM] [--court N]"
     exit 1
 fi
 
 LABEL_SUFFIX="$SITE_NAME"
 LOG_SUFFIX="$SITE_NAME"
 PROGRAM_ACCOUNT_ARGS=""
+PROGRAM_VENUE_ARGS=""
 PROGRAM_TIME_ARGS=""
+PROGRAM_COURT_ARGS=""
 if [[ -n "$ACCOUNT_NAME" ]]; then
     SAFE_ACCOUNT_NAME="${ACCOUNT_NAME//[^A-Za-z0-9_-]/_}"
     LABEL_SUFFIX="${SITE_NAME}.${SAFE_ACCOUNT_NAME}"
@@ -72,6 +85,17 @@ EOF
 )
 fi
 
+if [[ -n "$VENUE_NAME" ]]; then
+    SAFE_VENUE_NAME="${VENUE_NAME//[^A-Za-z0-9_-]/_}"
+    LABEL_SUFFIX="${LABEL_SUFFIX}.${SAFE_VENUE_NAME}"
+    LOG_SUFFIX="${LOG_SUFFIX}_${SAFE_VENUE_NAME}"
+    PROGRAM_VENUE_ARGS=$(cat <<EOF
+        <string>--venue</string>
+        <string>$VENUE_NAME</string>
+EOF
+)
+fi
+
 if [[ -n "$BOOKING_TIME" ]]; then
     SAFE_BOOKING_TIME="${BOOKING_TIME//:/-}"
     LABEL_SUFFIX="${LABEL_SUFFIX}.${SAFE_BOOKING_TIME}"
@@ -79,6 +103,16 @@ if [[ -n "$BOOKING_TIME" ]]; then
     PROGRAM_TIME_ARGS=$(cat <<EOF
         <string>--time</string>
         <string>$BOOKING_TIME</string>
+EOF
+)
+fi
+
+if [[ -n "$COURT_NUMBER" ]]; then
+    LABEL_SUFFIX="${LABEL_SUFFIX}.court-${COURT_NUMBER}"
+    LOG_SUFFIX="${LOG_SUFFIX}_court-${COURT_NUMBER}"
+    PROGRAM_COURT_ARGS=$(cat <<EOF
+        <string>--court</string>
+        <string>$COURT_NUMBER</string>
 EOF
 )
 fi
@@ -118,8 +152,8 @@ with open(config_path) as handle:
 
 timezone = ZoneInfo(config.get("timezone", "Europe/London"))
 pre_login_seconds = int(config.get("pre_login_seconds", 120))
-release_hour = int(config.get("release_hour", 0))
-release_minute = int(config.get("release_minute", 0))
+booking_open_time = config.get("booking_open_time", "00:00")
+release_hour, release_minute = [int(part) for part in booking_open_time.split(":", 1)]
 
 now = datetime.now(timezone)
 release = now.replace(hour=release_hour, minute=release_minute, second=0, microsecond=0)
@@ -166,12 +200,16 @@ cat > "$PLIST_PATH" << PLIST
 
     <key>ProgramArguments</key>
     <array>
+        <string>$CAFFEINATE</string>
+        <string>-dimsu</string>
         <string>$PYTHON</string>
         <string>$SCRIPT_DIR/main.py</string>
         <string>--site</string>
         <string>$SITE_NAME</string>
 $PROGRAM_ACCOUNT_ARGS
+$PROGRAM_VENUE_ARGS
 $PROGRAM_TIME_ARGS
+$PROGRAM_COURT_ARGS
     </array>
 
     <!-- Run daily at the site's configured pre-login time -->
@@ -213,8 +251,14 @@ echo "Scheduled site: $SITE_NAME"
 if [[ -n "$ACCOUNT_NAME" ]]; then
     echo "Scheduled account: $ACCOUNT_NAME"
 fi
+if [[ -n "$VENUE_NAME" ]]; then
+    echo "Scheduled venue: $VENUE_NAME"
+fi
 if [[ -n "$BOOKING_TIME" ]]; then
     echo "Scheduled booking time override: $BOOKING_TIME"
+fi
+if [[ -n "$COURT_NUMBER" ]]; then
+    echo "Scheduled court override: $COURT_NUMBER"
 fi
 echo ""
 echo "Tonight:"

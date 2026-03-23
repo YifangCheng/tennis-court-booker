@@ -39,6 +39,12 @@ def parse_args() -> argparse.Namespace:
         help="Override booking time. Default: value from the selected site's config.",
     )
     parser.add_argument(
+        "--court",
+        type=int,
+        default=None,
+        help="Optional preferred court number for sites that support explicit court selection.",
+    )
+    parser.add_argument(
         "--pay",
         action="store_true",
         help="Actually submit payment, even in --debug mode.",
@@ -47,6 +53,11 @@ def parse_args() -> argparse.Namespace:
         "--account",
         default=None,
         help="Optional account name for sites that support multiple login pairs, for example 'a' or 'secondary'.",
+    )
+    parser.add_argument(
+        "--venue",
+        default=None,
+        help="Optional venue slug for sites that support multiple venues, for example 'TannerStPark'.",
     )
     return parser.parse_args()
 
@@ -62,7 +73,9 @@ def main() -> None:
         force_pay=args.pay,
         date_override=args.date,
         time_override=args.time,
+        court_override=args.court,
         account_override=args.account,
+        venue_override=args.venue,
     )
     asyncio.run(site.run(options))
 

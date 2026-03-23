@@ -19,7 +19,7 @@ log = get_logger()
 
 class ClubSparkSite(BookingSite):
     name = "club_spark"
-    description = "Tanner St Park on ClubSpark"
+    description = "ClubSpark venue booker"
     env_prefix = "CLUB_SPARK"
 
     def __init__(self) -> None:
@@ -35,21 +35,20 @@ class ClubSparkSite(BookingSite):
         self.cfg = cfg
 
         self.tz_name = cfg.get("timezone", "Europe/London")
-        self.booking_date = cfg.get("booking_date")
-        self.booking_time = cfg.get("booking_time", "10:00")
         self.booking_duration_minutes = int(cfg.get("booking_duration_minutes", 60))
-        self.preferred_courts = cfg.get("preferred_courts", [3])
         self.headless = cfg.get("headless", True)
         self.pre_login_secs = int(cfg.get("pre_login_seconds", 120))
-        self.release_hour = int(cfg.get("release_hour", 20))
-        self.release_minute = int(cfg.get("release_minute", 0))
+        self.booking_open_time = cfg.get("booking_open_time", "20:00")
 
         self.card_number = os.environ.get("CARD_NUMBER", "")
         self.card_expiry = os.environ.get("CARD_EXPIRY", "")
         self.card_cvv = os.environ.get("CARD_CVV", "")
 
-        self.base_url = "https://clubspark.lta.org.uk/TannerStPark"
         self.api_base_url = "https://clubspark.lta.org.uk"
+        self.venue = ""
+        self.base_url = ""
+        self.booking_time = ""
+        self.preferred_courts: list[int] = []
         self.account_name = "a"
         self.username = ""
         self.password = ""
@@ -68,15 +67,38 @@ class ClubSparkSite(BookingSite):
     def validate_environment(self) -> None:
         if not self.username or not self.password:
             raise SystemExit(f"{self._username_env_key} and {self._password_env_key} must be set in .env")
+        if not self.venue:
+            raise SystemExit("club_spark requires --venue VENUE_SLUG, for example --venue TannerStPark")
+        if not self.booking_time:
+            raise SystemExit("club_spark requires --time HH:MM")
+        if not self.preferred_courts:
+            raise SystemExit("club_spark requires --court COURT_NUMBER")
+
+    def configure_venue(self, venue_override: Optional[str]) -> None:
+        venue = (venue_override or self.cfg.get("venue") or "").strip()
+        if not venue:
+            self.venue = ""
+            self.base_url = ""
+            return
+        self.venue = venue
+        self.base_url = f"{self.api_base_url}/{venue}"
+
+    def configure_booking(self, options: RunOptions) -> None:
+        self.booking_time = (options.time_override or "").strip()
+        if options.court_override is None:
+            self.preferred_courts = []
+        else:
+            self.preferred_courts = [int(options.court_override)]
 
     def booking_url_for(self, date: str) -> str:
         return f"{self.base_url}/Booking/BookByDate#?date={date}&role=guest"
 
     def release_time(self, timing: TimingHelper) -> datetime:
         now = timing.now_true()
+        open_hour, open_minute = self.booking_open_time.split(":")
         release = now.replace(
-            hour=self.release_hour,
-            minute=self.release_minute,
+            hour=int(open_hour),
+            minute=int(open_minute),
             second=0,
             microsecond=0,
         )
@@ -87,8 +109,6 @@ class ClubSparkSite(BookingSite):
     def target_date(self, timing: TimingHelper, override: Optional[str]) -> str:
         if override:
             return override
-        if self.booking_date:
-            return self.booking_date
         return (timing.now_true().date() + timedelta(days=7)).strftime("%Y-%m-%d")
 
     def booking_end_time(self, booking_time: str) -> str:
@@ -181,11 +201,11 @@ class ClubSparkSite(BookingSite):
         return await response.json()
 
     async def get_settings(self, page: Page) -> dict:
-        return await self.api_get_json(page, f"{self.api_base_url}/v0/VenueBooking/TannerStPark/GetSettings")
+        return await self.api_get_json(page, f"{self.api_base_url}/v0/VenueBooking/{self.venue}/GetSettings")
 
     async def get_venue_sessions(self, page: Page, date: str) -> dict:
         url = (
-            f"{self.api_base_url}/v0/VenueBooking/TannerStPark/GetVenueSessions"
+            f"{self.api_base_url}/v0/VenueBooking/{self.venue}/GetVenueSessions"
             f"?resourceID=&startDate={date}&endDate={date}&roleId="
         )
         return await self.api_get_json(page, url)
@@ -309,9 +329,9 @@ class ClubSparkSite(BookingSite):
         await page.locator('button[title="Log in"], button:has-text("Log in")').first.click()
 
         try:
-            await page.wait_for_url("**/TannerStPark/**", timeout=30_000)
+            await page.wait_for_url(f"**/{self.venue}/**", timeout=30_000)
         except Exception:
-            log.error("LTA login did not redirect back to Tanner St Park")
+            log.error(f"LTA login did not redirect back to {self.venue}")
             await self.shot(page, "club_04_login_failed")
             return False
 
@@ -624,6 +644,8 @@ class ClubSparkSite(BookingSite):
         return await self.wait_for_booking_confirmation(page)
 
     async def run(self, options: RunOptions) -> None:
+        self.configure_venue(options.venue_override)
+        self.configure_booking(options)
         self.configure_account(options.account_override)
         self.validate_environment()
         self._screenshots_enabled = options.debug
@@ -632,14 +654,14 @@ class ClubSparkSite(BookingSite):
         timing.sync_ntp()
 
         date = self.target_date(timing, options.date_override)
-        booking_time = options.time_override or self.booking_time
+        booking_time = self.booking_time
         release_time = self.release_time(timing)
         wait_secs = timing.secs_until(release_time)
 
         dry_run = options.debug and not options.force_pay
         mode = "DRY-RUN" if dry_run else ("DEBUG+PAY" if options.debug else "LIVE")
         log.info(
-            f"=== {self.name} | account={self.account_name} | {date} {booking_time} | "
+            f"=== {self.name} | venue={self.venue} | account={self.account_name} | {date} {booking_time} | "
             f"opens {release_time.strftime('%H:%M:%S %Z')} | {mode} ==="
         )
 

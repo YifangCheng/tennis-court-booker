@@ -44,7 +44,9 @@ class RunOptions:
     force_pay: bool
     date_override: Optional[str]
     time_override: Optional[str]
+    court_override: Optional[int]
     account_override: Optional[str]
+    venue_override: Optional[str]
 
 
 class TimingHelper:

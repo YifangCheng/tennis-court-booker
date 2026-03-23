@@ -5,13 +5,12 @@ This plugin targets Tanner St Park on ClubSpark. It uses a safer hybrid flow: pr
 ## Run Commands
 
 ```bash
-python main.py --site club_spark --debug --now --date 2026-03-24 --time 10:00
-python main.py --site club_spark --debug --now --pay --date 2026-03-24 --time 10:00
-python main.py --site club_spark --account a --pay --date 2026-03-27 --time 10:00
-python main.py --site club_spark --account b --pay --date 2026-03-27 --time 11:00
-python main.py --site club_spark
-bash schedule.sh --site club_spark --account a --time 10:00
-bash schedule.sh --site club_spark --account b --time 11:00
+python main.py --site club_spark --venue TannerStPark --court 4 --debug --now --date 2026-03-24 --time 10:00
+python main.py --site club_spark --venue TannerStPark --court 4 --debug --now --pay --date 2026-03-24 --time 10:00
+python main.py --site club_spark --venue TannerStPark --court 4 --account a --pay --date 2026-03-27 --time 10:00
+python main.py --site club_spark --venue TannerStPark --court 4 --account b --pay --date 2026-03-27 --time 11:00
+bash schedule.sh --site club_spark --venue TannerStPark --court 4 --account a --time 10:00
+bash schedule.sh --site club_spark --venue TannerStPark --court 4 --account b --time 11:00
 ```
 
 ## Booking Rules
@@ -19,9 +18,11 @@ bash schedule.sh --site club_spark --account b --time 11:00
 - New day release time: `20:00`
 - Booking window: `7 days in advance`
 - Default duration: `60 minutes`
-- Court priority comes from `preferred_courts` in `sites/club_spark/config.json`
+- `--venue` is required, for example `TannerStPark` or `GeraldineMaryHarmsworth`
+- `--court` is required, for example `--court 4`
 - Account `a` is the implicit default, and `--account` selects `CLUB_SPARK_<ACCOUNT>_BOOKING_USERNAME` / `...PASSWORD`
-- `--time HH:MM` can override `booking_time` for a scheduled or manual run
+- `--time HH:MM` is required for ClubSpark booking runs
+- `booking_open_time` in `sites/club_spark/config.json` controls when new bookings open
 
 Without `--date`, the plugin targets `today + 7 days`, which matches the site's release rule. For example, if today is Tuesday, it targets next Tuesday.
 
