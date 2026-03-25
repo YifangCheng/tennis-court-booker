@@ -27,9 +27,12 @@ class ClubSparkSite(BookingSite):
         self.shots_dir = ROOT / "screenshots"
         self.shots_dir.mkdir(exist_ok=True)
         self.network_log_path = ROOT / "network_log.club_spark.json"
+        self.live_network_log_path = ROOT / "network_log.club_spark.live.json"
         self.cookies_path = ROOT / "debug_cookies.club_spark.json"
+        self.live_timeout_shot_path = self.shots_dir / "club_10_payment_timeout_live.png"
         self._screenshots_enabled = False
         self.resource_ids_by_court = {}
+        self._capture_live_diagnostics = False
 
         cfg = load_json(self.site_dir / "config.json")
         self.cfg = cfg
@@ -124,18 +127,27 @@ class ClubSparkSite(BookingSite):
         if not self._screenshots_enabled:
             return
         path = self.shots_dir / f"{name}.png"
+        await self.write_screenshot(page, path, full_page=full_page)
+
+    async def write_screenshot(self, page: Page, path: Path, full_page: bool = True) -> None:
         try:
             await page.screenshot(path=str(path), full_page=full_page, timeout=5_000)
-            log.info(f"  Screenshot → screenshots/{name}.png")
+            if path.parent == self.shots_dir:
+                log.info(f"  Screenshot → screenshots/{path.name}")
+            else:
+                log.info(f"  Screenshot → {path}")
         except Exception as exc:
             if full_page:
                 try:
                     await page.screenshot(path=str(path), full_page=False, timeout=3_000)
-                    log.info(f"  Screenshot (viewport) → screenshots/{name}.png")
+                    if path.parent == self.shots_dir:
+                        log.info(f"  Screenshot (viewport) → screenshots/{path.name}")
+                    else:
+                        log.info(f"  Screenshot (viewport) → {path}")
                 except Exception as fallback_exc:
-                    log.warning(f"  Screenshot '{name}' failed (non-fatal): {fallback_exc}")
+                    log.warning(f"  Screenshot '{path.name}' failed (non-fatal): {fallback_exc}")
             else:
-                log.warning(f"  Screenshot '{name}' failed (non-fatal): {exc}")
+                log.warning(f"  Screenshot '{path.name}' failed (non-fatal): {exc}")
 
     def attach_network_logger(self, page: Page) -> list:
         entries = []
@@ -154,13 +166,21 @@ class ClubSparkSite(BookingSite):
                 {
                     "method": request.method,
                     "url": request.url,
+                    "resource_type": request.resource_type,
                     "headers": dict(request.headers),
                     "post_data": body,
                     "responses": [],
                 }
             )
 
+        def _on_request_failed(request) -> None:
+            for entry in reversed(entries):
+                if entry["url"] == request.url and entry["method"] == request.method:
+                    entry.setdefault("failures", []).append(request.failure)
+                    break
+
         page.on("request", _on_request)
+        page.on("requestfailed", _on_request_failed)
         return entries
 
     async def attach_network_response_logger(self, page: Page, entries: list) -> None:
@@ -184,9 +204,12 @@ class ClubSparkSite(BookingSite):
         page.on("response", _on_response)
 
     def save_network_log(self, entries: list) -> None:
-        with open(self.network_log_path, "w") as handle:
+        self.save_network_log_to(entries, self.network_log_path)
+
+    def save_network_log_to(self, entries: list, path: Path) -> None:
+        with open(path, "w") as handle:
             _json.dump(entries, handle, indent=2)
-        log.info(f"Network log → {self.network_log_path.name} ({len(entries)} entries)")
+        log.info(f"Network log → {path.name} ({len(entries)} entries)")
 
     async def api_get_json(self, page: Page, url: str) -> dict:
         response = await page.context.request.get(
@@ -286,6 +309,26 @@ class ClubSparkSite(BookingSite):
         return True
 
     async def dismiss_cookie_banner(self, page: Page) -> None:
+        button_selectors = [
+            "button:has-text('Reject Non-Essential')",
+            "button:has-text('Reject non-essential')",
+            "button:has-text('Accept All')",
+            "button:has-text('Accept all')",
+            "button:has-text('OK')",
+            "button:has-text('Ok')",
+            "button:has-text('Close')",
+            "[aria-label='Close']",
+        ]
+        for selector in button_selectors:
+            try:
+                button = page.locator(selector).first
+                if await button.is_visible(timeout=500):
+                    await button.click(timeout=2_000)
+                    await asyncio.sleep(0.2)
+                    break
+            except Exception:
+                pass
+
         selectors = [
             "#CybotCookiebotDialog",
             "#CybotCookiebotDialogBodyUnderlay",
@@ -303,6 +346,126 @@ class ClubSparkSite(BookingSite):
                 )
             except Exception:
                 pass
+
+    async def visible_messages(self, page: Page) -> list[str]:
+        selectors = [
+            ".validation-summary-errors",
+            ".field-validation-error",
+            ".alert-danger",
+            ".alert-warning",
+            ".alert-error",
+            ".error-message",
+            ".error",
+            "[role='alert']",
+            ".notification",
+            ".message",
+        ]
+        messages: list[str] = []
+        seen = set()
+        for selector in selectors:
+            try:
+                locators = page.locator(selector)
+                count = await locators.count()
+            except Exception:
+                continue
+            for index in range(min(count, 5)):
+                try:
+                    locator = locators.nth(index)
+                    if not await locator.is_visible(timeout=150):
+                        continue
+                    text = " ".join((await locator.inner_text(timeout=500)).split())
+                except Exception:
+                    continue
+                if len(text) < 3 or text.lower() in seen:
+                    continue
+                messages.append(text[:200])
+                seen.add(text.lower())
+                if len(messages) >= 5:
+                    return messages
+        return messages
+
+    async def paynow_status(self, page: Page) -> tuple[bool, Optional[str], Optional[str]]:
+        paynow = page.locator("#paynow").first
+        try:
+            if not await paynow.is_visible(timeout=250):
+                return False, None, None
+        except Exception:
+            return False, None, None
+
+        disabled = None
+        for attr in ("disabled", "aria-disabled"):
+            try:
+                value = await paynow.get_attribute(attr)
+            except Exception:
+                value = None
+            if value is not None:
+                disabled = f"{attr}={value}"
+                break
+        try:
+            classes = await paynow.get_attribute("class")
+        except Exception:
+            classes = None
+        return True, disabled, classes
+
+    async def stripe_is_ready(self, page: Page) -> bool:
+        stripe_selectors = [
+            'iframe[title="Secure card number input frame"]',
+            'iframe[title="Secure expiration date input frame"]',
+            'iframe[title="Secure CVC input frame"]',
+            'iframe[title*="Secure card"]',
+            'iframe[title*="card number"]',
+            'iframe[title*="expiration"]',
+            'iframe[title*="CVC"]',
+            'iframe[src*="js.stripe.com"]',
+            'iframe[name^="__privateStripeFrame"]',
+            ".StripeElement",
+            "[class*='StripeElement']",
+        ]
+        for selector in stripe_selectors:
+            try:
+                if await page.locator(selector).first.is_visible(timeout=250):
+                    return True
+            except Exception:
+                pass
+        for selector in (
+            'iframe[src*="js.stripe.com"]',
+            'iframe[name^="__privateStripeFrame"]',
+            ".StripeElement",
+            "[class*='StripeElement']",
+        ):
+            try:
+                if await page.locator(selector).count():
+                    return True
+            except Exception:
+                pass
+        return False
+
+    async def fill_stripe_input(self, page: Page, selectors: list[str], value: str, field_name: str) -> None:
+        frame_selectors = [
+            'iframe[title="Secure card number input frame"]',
+            'iframe[title="Secure expiration date input frame"]',
+            'iframe[title="Secure CVC input frame"]',
+            'iframe[title*="Secure"]',
+            'iframe[src*="js.stripe.com"]',
+            'iframe[name^="__privateStripeFrame"]',
+        ]
+        for frame_selector in frame_selectors:
+            try:
+                frame_count = await page.locator(frame_selector).count()
+            except Exception:
+                frame_count = 0
+            for index in range(frame_count):
+                frame = page.frame_locator(frame_selector).nth(index)
+                for selector in selectors:
+                    locator = frame.locator(selector).first
+                    try:
+                        await locator.wait_for(timeout=750)
+                        await locator.click()
+                        await locator.press_sequentially(value, delay=50)
+                        return
+                    except Exception:
+                        continue
+        raise RuntimeError(f"Could not find Stripe {field_name} input")
 
     async def sign_in_link_visible(self, page: Page) -> bool:
         locator = page.locator('[data-testid="sign-in-link"]').first
@@ -430,6 +593,7 @@ class ClubSparkSite(BookingSite):
             log.error("'Continue booking' not found")
             return False
 
+        await self.dismiss_cookie_banner(page)
         await page.click("#submit-booking")
         log.info("Continue booking clicked")
 
@@ -453,26 +617,19 @@ class ClubSparkSite(BookingSite):
             "h1:has-text('Thank you'), p:has-text('successfully booked'), "
             ".booking-confirmed, .alert-success"
         )
-        stripe_selector = (
-            'iframe[title="Secure card number input frame"], '
-            'iframe[title="Secure expiration date input frame"], '
-            'iframe[title="Secure CVC input frame"]'
-        )
         loading_selector = (
             ".loading, .spinner, .loading-spinner, .cs-loading, .blockUI, "
             "[aria-busy='true'], [data-testid*='loading']"
         )
         paynow = page.locator("#paynow").first
+        await self.dismiss_cookie_banner(page)
         try:
             if await page.locator(confirmation_selector).first.is_visible(timeout=250):
                 return "confirmed", "confirmation page visible"
         except Exception:
             pass
-        try:
-            if await page.locator(stripe_selector).first.is_visible(timeout=250):
-                return "stripe_ready", "stripe iframe visible"
-        except Exception:
-            pass
+        if await self.stripe_is_ready(page):
+            return "stripe_ready", "stripe elements detected"
         fatal_texts = [
             "something went wrong",
             "payment failed",
@@ -486,6 +643,14 @@ class ClubSparkSite(BookingSite):
             body_text = (await page.locator("body").inner_text(timeout=500)).lower()
         except Exception:
             body_text = ""
+        messages = await self.visible_messages(page)
+        if messages:
+            error_like = [
+                message for message in messages
+                if any(word in message.lower() for word in ["error", "failed", "unable", "required", "select", "choose"])
+            ]
+            if error_like:
+                return "fatal_error", error_like[0]
         for text in fatal_texts:
             if text in body_text:
                 return "fatal_error", text
@@ -496,14 +661,15 @@ class ClubSparkSite(BookingSite):
             pass
         if any(text in body_text for text in ["loading", "processing", "please wait", "creating payment"]):
             return "loading", "page text indicates payment is still loading"
-        try:
-            if await paynow.is_visible(timeout=250):
-                disabled = await paynow.get_attribute("disabled")
-                if disabled is not None:
-                    return "loading", "confirm and pay button is disabled"
-                return "paynow_visible", "confirm and pay button still visible"
-        except Exception:
-            pass
+        visible, disabled, classes = await self.paynow_status(page)
+        if visible:
+            if disabled is not None:
+                return "loading", f"confirm and pay button is disabled ({disabled})"
+            if classes and "disabled" in classes.lower():
+                return "loading", f"confirm and pay button class indicates disabled ({classes})"
+            if messages:
+                return "paynow_visible", f"confirm and pay still visible; messages={messages[0]}"
+            return "paynow_visible", "confirm and pay button still visible"
         return "waiting", "payment session pending"
 
     async def wait_for_payment_ready(self, page: Page) -> str:
@@ -543,8 +709,16 @@ class ClubSparkSite(BookingSite):
             body = (await page.locator("body").inner_text(timeout=1_000))[:400].replace("\n", " ")
         except Exception:
             body = "<could not read page text>"
-        log.error(f"Payment session timed out after prolonged wait. url={url} body={body}")
+        messages = await self.visible_messages(page)
+        visible, disabled, classes = await self.paynow_status(page)
+        log.error(
+            f"Payment session timed out after prolonged wait. url={url} "
+            f"paynow_visible={visible} paynow_disabled={disabled} paynow_classes={classes} "
+            f"messages={messages} body={body}"
+        )
         await self.shot(page, "club_10_payment_timeout", full_page=False)
+        if self._capture_live_diagnostics and not self._screenshots_enabled:
+            await self.write_screenshot(page, self.live_timeout_shot_path, full_page=False)
         return "timeout"
 
     async def wait_for_booking_confirmation(self, page: Page) -> bool:
@@ -584,8 +758,10 @@ class ClubSparkSite(BookingSite):
     async def pay(self, page: Page, dry_run: bool) -> bool:
         try:
             await page.wait_for_selector("#paynow", timeout=20_000)
+            await self.dismiss_cookie_banner(page)
             await page.locator("#paynow").click(force=True)
             log.info("Confirm and pay clicked")
+            await self.shot(page, "club_10_after_confirm_and_pay", full_page=False)
         except Exception as exc:
             log.error(f"'Confirm and pay' not found: {exc}")
             await self.shot(page, "club_10_pay_error", full_page=False)
@@ -602,23 +778,37 @@ class ClubSparkSite(BookingSite):
             return False
 
         try:
-            num_input = page.frame_locator('iframe[title="Secure card number input frame"]').locator(
-                'input[placeholder*="1234"]'
+            await self.fill_stripe_input(
+                page,
+                [
+                    'input[placeholder*="1234"]',
+                    'input[name="cardnumber"]',
+                    'input[autocomplete="cc-number"]',
+                    'input[inputmode="numeric"]',
+                ],
+                self.card_number,
+                "card number",
             )
-            await num_input.click()
-            await num_input.press_sequentially(self.card_number, delay=50)
-
-            exp_input = page.frame_locator('iframe[title="Secure expiration date input frame"]').locator(
-                'input[placeholder*="MM"]'
+            await self.fill_stripe_input(
+                page,
+                [
+                    'input[placeholder*="MM"]',
+                    'input[name="exp-date"]',
+                    'input[autocomplete="cc-exp"]',
+                ],
+                self.card_expiry,
+                "expiry",
             )
-            await exp_input.click()
-            await exp_input.press_sequentially(self.card_expiry, delay=50)
-
-            cvc_input = page.frame_locator('iframe[title="Secure CVC input frame"]').locator(
-                'input[name="cvc"]'
+            await self.fill_stripe_input(
+                page,
+                [
+                    'input[name="cvc"]',
+                    'input[placeholder*="CVC"]',
+                    'input[autocomplete="cc-csc"]',
+                ],
+                self.card_cvv,
+                "CVC",
             )
-            await cvc_input.click()
-            await cvc_input.press_sequentially(self.card_cvv, delay=50)
             log.info("Card filled")
             await asyncio.sleep(1)
             # Stripe/modal pages are not reliable screenshot targets.
@@ -649,6 +839,7 @@ class ClubSparkSite(BookingSite):
         self.configure_account(options.account_override)
         self.validate_environment()
         self._screenshots_enabled = options.debug
+        self._capture_live_diagnostics = not options.debug
 
         timing = TimingHelper(self.tz_name, log)
         timing.sync_ntp()
@@ -687,15 +878,14 @@ class ClubSparkSite(BookingSite):
             page = await context.new_page()
 
             net_entries = []
-            if options.debug:
+            if options.debug or self._capture_live_diagnostics:
                 net_entries = self.attach_network_logger(page)
                 await self.attach_network_response_logger(page, net_entries)
 
-            if not await self.login(page, date):
-                await browser.close()
-                return
+            try:
+                if not await self.login(page, date):
+                    return
 
-            if not options.debug:
                 for pattern in [
                     "**/*.{png,jpg,jpeg,gif,svg,ico,woff,woff2,ttf,eot}",
                     "**/google-analytics.com/**",
@@ -704,52 +894,51 @@ class ClubSparkSite(BookingSite):
                 ]:
                     await page.route(pattern, lambda route: route.abort())
 
-            await self.goto_booking_page(page, date)
+                await self.goto_booking_page(page, date)
 
-            if not options.skip_wait and not options.debug:
-                remaining = timing.secs_until(release_time)
-                if remaining > 0:
-                    log.info(f"Waiting {remaining:.1f}s")
-                    while True:
-                        remaining = timing.secs_until(release_time)
-                        if remaining <= 0.2:
-                            break
-                        await asyncio.sleep(min(remaining - 0.2, 1.0))
-                    while timing.secs_until(release_time) > 0:
-                        pass
-                log.info(">>> RELEASE TIME <<<")
-            else:
-                log.info("Skipping release-time wait.")
+                if not options.skip_wait and not options.debug:
+                    remaining = timing.secs_until(release_time)
+                    if remaining > 0:
+                        log.info(f"Waiting {remaining:.1f}s")
+                        while True:
+                            remaining = timing.secs_until(release_time)
+                            if remaining <= 0.2:
+                                break
+                            await asyncio.sleep(min(remaining - 0.2, 1.0))
+                        while timing.secs_until(release_time) > 0:
+                            pass
+                    log.info(">>> RELEASE TIME <<<")
+                else:
+                    log.info("Skipping release-time wait.")
 
-            slot_available = await self.wait_for_slot_via_api(page, booking_time, date)
-            if not slot_available:
-                log.error("API booking path did not find a matching slot; stopping without UI fallback")
+                slot_available = await self.wait_for_slot_via_api(page, booking_time, date)
+                if not slot_available:
+                    log.error("API booking path did not find a matching slot; stopping without UI fallback")
+                    return
+
+                log.info("Reloading booking page after API confirmation so the UI reflects the newly released slot")
+                await page.reload(wait_until="commit", timeout=10_000)
+                await page.wait_for_load_state("networkidle", timeout=20_000)
+                await self.dismiss_cookie_banner(page)
+
+                if not await self.click_slot(page, booking_time):
+                    return
+
+                if not await self.confirm_popup(page):
+                    return
+
+                await self.pay(page, dry_run=dry_run)
+            finally:
+                if options.debug:
+                    self.save_network_log(net_entries)
+                    try:
+                        cookies = await context.cookies()
+                        with open(self.cookies_path, "w") as handle:
+                            _json.dump(cookies, handle, indent=2)
+                        log.info(f"Cookies saved → {self.cookies_path.name}  ({len(cookies)} cookies)")
+                    except Exception as exc:
+                        log.warning(f"Could not save cookies: {exc}")
+                elif net_entries:
+                    self.save_network_log_to(net_entries, self.live_network_log_path)
+
                 await browser.close()
-                return
-
-            log.info("Reloading booking page after API confirmation so the UI reflects the newly released slot")
-            await page.reload(wait_until="commit", timeout=10_000)
-            await page.wait_for_load_state("networkidle", timeout=20_000)
-            await self.dismiss_cookie_banner(page)
-
-            if not await self.click_slot(page, booking_time):
-                await browser.close()
-                return
-
-            if not await self.confirm_popup(page):
-                await browser.close()
-                return
-
-            await self.pay(page, dry_run=dry_run)
-
-            if options.debug:
-                self.save_network_log(net_entries)
-                try:
-                    cookies = await context.cookies()
-                    with open(self.cookies_path, "w") as handle:
-                        _json.dump(cookies, handle, indent=2)
-                    log.info(f"Cookies saved → {self.cookies_path.name}  ({len(cookies)} cookies)")
-                except Exception as exc:
-                    log.warning(f"Could not save cookies: {exc}")
-
-            await browser.close()
