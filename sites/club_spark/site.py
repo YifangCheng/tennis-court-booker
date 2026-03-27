@@ -1,10 +1,12 @@
 import asyncio
 import json as _json
 import os
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 from time import monotonic
 from typing import Optional
+from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 
 import pytz
 from playwright._impl._errors import TargetClosedError
@@ -31,8 +33,8 @@ class ClubSparkSite(BookingSite):
         self.cookies_path = ROOT / "debug_cookies.club_spark.json"
         self.live_timeout_shot_path = self.shots_dir / "club_10_payment_timeout_live.png"
         self._screenshots_enabled = False
-        self.resource_ids_by_court = {}
         self._capture_live_diagnostics = False
+        self._network_entries: list[dict] = []
 
         cfg = load_json(self.site_dir / "config.json")
         self.cfg = cfg
@@ -114,14 +116,44 @@ class ClubSparkSite(BookingSite):
             return override
         return (timing.now_true().date() + timedelta(days=7)).strftime("%Y-%m-%d")
 
-    def booking_end_time(self, booking_time: str) -> str:
-        slot_start = datetime.strptime(booking_time, "%H:%M")
-        slot_end = slot_start + timedelta(minutes=self.booking_duration_minutes)
-        return slot_end.strftime("%H:%M")
-
     def booking_minutes(self, booking_time: str) -> int:
         hours, minutes = booking_time.split(":")
         return int(hours) * 60 + int(minutes)
+
+    def minutes_to_time(self, total_minutes: int) -> str:
+        return f"{total_minutes // 60:02d}:{total_minutes % 60:02d}"
+
+    def money_text(self, value: float) -> str:
+        return f"{value:.2f}"
+
+    def build_slot_details(self, resource: dict, session: dict, date: str, booking_time: str) -> dict:
+        start_minutes = self.booking_minutes(booking_time)
+        end_minutes = start_minutes + self.booking_duration_minutes
+        interval_minutes = max(1, int(session.get("Interval") or 30))
+        interval_count = max(1, (self.booking_duration_minutes + interval_minutes - 1) // interval_minutes)
+        court_cost_per_interval = float(session.get("CourtCost", session.get("Cost", 0.0)) or 0.0)
+        lighting_cost_per_interval = float(session.get("LightingCost", 0.0) or 0.0)
+        court_cost = round(court_cost_per_interval * interval_count, 2)
+        lighting_cost = round(lighting_cost_per_interval * interval_count, 2)
+        total_cost = round(court_cost + lighting_cost, 2)
+
+        return {
+            "date": date,
+            "resource_id": resource.get("ID", ""),
+            "resource_group_id": resource.get("ResourceGroupID", ""),
+            "resource_name": resource.get("Name", ""),
+            "court_number": self.court_number(resource),
+            "session_id": session.get("ID", ""),
+            "category": int(session.get("Category", 0) or 0),
+            "sub_category": int(session.get("SubCategory", 0) or 0),
+            "start_time": start_minutes,
+            "end_time": end_minutes,
+            "interval_minutes": interval_minutes,
+            "interval_count": interval_count,
+            "court_cost": court_cost,
+            "lighting_cost": lighting_cost,
+            "total_cost": total_cost,
+        }
 
     async def shot(self, page: Page, name: str, full_page: bool = True) -> None:
         if not self._screenshots_enabled:
@@ -183,22 +215,30 @@ class ClubSparkSite(BookingSite):
         page.on("requestfailed", _on_request_failed)
         return entries
 
-    async def attach_network_response_logger(self, page: Page, entries: list) -> None:
+    async def attach_network_response_logger(self, page: Page, entries: list, capture_bodies: bool = True) -> None:
         async def _on_response(response) -> None:
+            req = None
             try:
                 req = response.request
                 is_xhr = req.resource_type in ("xhr", "fetch")
                 is_post_doc = req.resource_type == "document" and req.method != "GET"
                 if not (is_xhr or is_post_doc):
                     return
-                body = await response.text()
+                body = None
+                if capture_bodies:
+                    body = await response.text()
             except TargetClosedError:
                 return
             except Exception:
-                body = "<could not read body>"
+                if req is None:
+                    return
+                body = "<could not read body>" if capture_bodies else None
             for entry in reversed(entries):
-                if entry["url"] == response.url:
-                    entry["responses"].append({"status": response.status, "body": body[:50000]})
+                if entry["url"] == response.url and entry["method"] == req.method:
+                    response_entry = {"status": response.status}
+                    if capture_bodies:
+                        response_entry["body"] = body[:50000] if isinstance(body, str) else body
+                    entry["responses"].append(response_entry)
                     break
 
         page.on("response", _on_response)
@@ -210,6 +250,34 @@ class ClubSparkSite(BookingSite):
         with open(path, "w") as handle:
             _json.dump(entries, handle, indent=2)
         log.info(f"Network log → {path.name} ({len(entries)} entries)")
+
+    def latest_network_entry(self, url_fragment: str) -> Optional[dict]:
+        for entry in reversed(self._network_entries):
+            if url_fragment in entry.get("url", ""):
+                return entry
+        return None
+
+    def latest_network_post_params(self, url_fragment: str) -> dict[str, str]:
+        entry = self.latest_network_entry(url_fragment)
+        if not entry:
+            return {}
+        post_data = entry.get("post_data") or ""
+        params = parse_qs(post_data)
+        return {key: values[-1] for key, values in params.items() if values}
+
+    def latest_network_response_json(self, url_fragment: str) -> Optional[dict]:
+        entry = self.latest_network_entry(url_fragment)
+        if not entry:
+            return None
+        for response in reversed(entry.get("responses", [])):
+            body = response.get("body") or ""
+            if not body or body == "<could not read body>":
+                continue
+            try:
+                return _json.loads(body)
+            except Exception:
+                continue
+        return None
 
     async def api_get_json(self, page: Page, url: str) -> dict:
         response = await page.context.request.get(
@@ -233,6 +301,22 @@ class ClubSparkSite(BookingSite):
         )
         return await self.api_get_json(page, url)
 
+    async def get_current_user(self, page: Page) -> dict:
+        return await self.api_get_json(page, f"{self.api_base_url}/v2/User/GetCurrentUser")
+
+    def venue_contact_for_user(self, user: dict, venue_id: str) -> Optional[dict]:
+        for contact in user.get("VenueContacts", []):
+            if contact.get("VenueID") == venue_id or contact.get("VenueUrlSegment") == self.venue:
+                return {
+                    "first_name": user.get("FirstName", ""),
+                    "last_name": user.get("LastName", ""),
+                    "email": user.get("EmailAddress", ""),
+                    "venue_contact_id": contact.get("VenueContactID", ""),
+                    "venue_id": contact.get("VenueID", ""),
+                    "venue_name": contact.get("VenueName", self.venue),
+                }
+        return None
+
     def court_number(self, resource: dict) -> Optional[int]:
         number = resource.get("Number")
         if isinstance(number, int):
@@ -244,15 +328,6 @@ class ClubSparkSite(BookingSite):
             except ValueError:
                 return None
         return None
-
-    def cache_resource_map(self, sessions: dict) -> None:
-        mapping = {}
-        for resource in sessions.get("Resources", []):
-            court_num = self.court_number(resource)
-            if court_num is not None:
-                mapping[court_num] = resource.get("ID")
-        if mapping:
-            self.resource_ids_by_court = mapping
 
     def session_is_available(self, session: dict, start_minutes: int) -> bool:
         if session.get("Category") != 0:
@@ -290,23 +365,22 @@ class ClubSparkSite(BookingSite):
 
         return None, None
 
-    async def wait_for_slot_via_api(self, page: Page, booking_time: str, date: str) -> bool:
+    async def wait_for_slot_via_api(self, page: Page, booking_time: str, date: str) -> Optional[dict]:
         try:
             sessions = await self.get_venue_sessions(page, date)
-            self.cache_resource_map(sessions)
         except Exception as exc:
             log.error(f"Could not load ClubSpark booking API data: {exc}")
-            return False
+            return None
 
         resource, session = self.find_slot_from_sessions(sessions, booking_time)
         if not resource or not session:
             log.error(f"No API slot found at {booking_time}")
-            return False
+            return None
 
         log.info(
             f"API slot found at {booking_time} on resource {resource['ID']} (session {session['ID']})"
         )
-        return True
+        return self.build_slot_details(resource, session, date, booking_time)
 
     async def dismiss_cookie_banner(self, page: Page) -> None:
         button_selectors = [
@@ -346,126 +420,6 @@ class ClubSparkSite(BookingSite):
                 )
             except Exception:
                 pass
-
-    async def visible_messages(self, page: Page) -> list[str]:
-        selectors = [
-            ".validation-summary-errors",
-            ".field-validation-error",
-            ".alert-danger",
-            ".alert-warning",
-            ".alert-error",
-            ".error-message",
-            ".error",
-            "[role='alert']",
-            ".notification",
-            ".message",
-        ]
-        messages: list[str] = []
-        seen = set()
-        for selector in selectors:
-            try:
-                locators = page.locator(selector)
-                count = await locators.count()
-            except Exception:
-                continue
-            for index in range(min(count, 5)):
-                try:
-                    locator = locators.nth(index)
-                    if not await locator.is_visible(timeout=150):
-                        continue
-                    text = " ".join((await locator.inner_text(timeout=500)).split())
-                except Exception:
-                    continue
-                if len(text) < 3 or text.lower() in seen:
-                    continue
-                messages.append(text[:200])
-                seen.add(text.lower())
-                if len(messages) >= 5:
-                    return messages
-        return messages
-
-    async def paynow_status(self, page: Page) -> tuple[bool, Optional[str], Optional[str]]:
-        paynow = page.locator("#paynow").first
-        try:
-            if not await paynow.is_visible(timeout=250):
-                return False, None, None
-        except Exception:
-            return False, None, None
-
-        disabled = None
-        for attr in ("disabled", "aria-disabled"):
-            try:
-                value = await paynow.get_attribute(attr)
-            except Exception:
-                value = None
-            if value is not None:
-                disabled = f"{attr}={value}"
-                break
-        try:
-            classes = await paynow.get_attribute("class")
-        except Exception:
-            classes = None
-        return True, disabled, classes
-
-    async def stripe_is_ready(self, page: Page) -> bool:
-        stripe_selectors = [
-            'iframe[title="Secure card number input frame"]',
-            'iframe[title="Secure expiration date input frame"]',
-            'iframe[title="Secure CVC input frame"]',
-            'iframe[title*="Secure card"]',
-            'iframe[title*="card number"]',
-            'iframe[title*="expiration"]',
-            'iframe[title*="CVC"]',
-            'iframe[src*="js.stripe.com"]',
-            'iframe[name^="__privateStripeFrame"]',
-            ".StripeElement",
-            "[class*='StripeElement']",
-        ]
-        for selector in stripe_selectors:
-            try:
-                if await page.locator(selector).first.is_visible(timeout=250):
-                    return True
-            except Exception:
-                pass
-        for selector in (
-            'iframe[src*="js.stripe.com"]',
-            'iframe[name^="__privateStripeFrame"]',
-            ".StripeElement",
-            "[class*='StripeElement']",
-        ):
-            try:
-                if await page.locator(selector).count():
-                    return True
-            except Exception:
-                pass
-        return False
-
-    async def fill_stripe_input(self, page: Page, selectors: list[str], value: str, field_name: str) -> None:
-        frame_selectors = [
-            'iframe[title="Secure card number input frame"]',
-            'iframe[title="Secure expiration date input frame"]',
-            'iframe[title="Secure CVC input frame"]',
-            'iframe[title*="Secure"]',
-            'iframe[src*="js.stripe.com"]',
-            'iframe[name^="__privateStripeFrame"]',
-        ]
-        for frame_selector in frame_selectors:
-            try:
-                frame_count = await page.locator(frame_selector).count()
-            except Exception:
-                frame_count = 0
-            for index in range(frame_count):
-                frame = page.frame_locator(frame_selector).nth(index)
-                for selector in selectors:
-                    locator = frame.locator(selector).first
-                    try:
-                        await locator.wait_for(timeout=750)
-                        await locator.click()
-                        await locator.press_sequentially(value, delay=50)
-                        return
-                    except Exception:
-                        continue
-        raise RuntimeError(f"Could not find Stripe {field_name} input")
 
     async def sign_in_link_visible(self, page: Page) -> bool:
         locator = page.locator('[data-testid="sign-in-link"]').first
@@ -516,210 +470,66 @@ class ClubSparkSite(BookingSite):
         log.info(f"Booking page loaded ({date})")
         await self.shot(page, "club_05_booking_page")
 
-    async def select_duration(self, page: Page, booking_time: str) -> bool:
-        if self.booking_duration_minutes <= 30:
-            return True
+    def direct_booking_url(self, slot: dict) -> str:
+        query = urlencode(
+            {
+                "Contacts[0].IsPrimary": "true",
+                "Contacts[0].IsJunior": "false",
+                "Contacts[0].IsPlayer": "true",
+                "ResourceID": slot["resource_id"],
+                "Date": slot["date"],
+                "SessionID": slot["session_id"],
+                "StartTime": str(slot["start_time"]),
+                "EndTime": str(slot["end_time"]),
+                "Category": str(slot["category"]),
+                "SubCategory": str(slot["sub_category"]),
+                "VenueID": slot["resource_group_id"],
+                "ResourceGroupID": slot["resource_group_id"],
+            }
+        )
+        return f"{self.base_url}/Booking/Book?{query}"
 
-        end_time = self.booking_end_time(booking_time)
-        container = page.locator("#select2-booking-duration-container")
+    def stripe_runtime_from_content(self, content: str) -> Optional[dict]:
+        key = None
+        stripe_account = None
+        stripe_js_id = None
+        key_match = re.search(r"pk_(?:live|test)_[A-Za-z0-9]+", content)
+        if key_match:
+            key = key_match.group(0)
+        account_match = re.search(r"acct_[A-Za-z0-9]+", content)
+        if account_match:
+            stripe_account = account_match.group(0)
+        session_match = re.search(
+            r"(?:stripe_js_id|clientSessionId|client_session_id)[^A-Za-z0-9-]+([0-9a-fA-F-]{16,})",
+            content,
+            flags=re.IGNORECASE,
+        )
+        if session_match:
+            stripe_js_id = session_match.group(1)
+        if not key or not stripe_account:
+            return None
+        return {
+            "key": key,
+            "stripe_account": stripe_account,
+            "stripe_js_id": stripe_js_id,
+        }
+
+    async def goto_direct_booking_page(self, page: Page, slot: dict) -> bool:
+        url = self.direct_booking_url(slot)
         try:
-            await container.wait_for(timeout=8_000)
-        except Exception:
-            log.error("Booking duration dropdown not found")
-            return False
-
-        current = await container.get_attribute("title")
-        if current == end_time:
-            return True
-
-        await container.click()
-        option = page.locator(".select2-results__option", has_text=end_time).first
-        try:
-            await option.wait_for(timeout=5_000)
-            await option.click()
-            log.info(f"Booking duration set to 1 hour (end {end_time})")
-            await self.shot(page, "club_07_duration_selected", full_page=False)
+            await page.goto(url, wait_until="domcontentloaded", timeout=10_000)
+            await self.dismiss_cookie_banner(page)
+            await page.wait_for_selector("#paynow", timeout=5_000)
+            log.info("Direct booking page loaded")
+            await self.shot(page, "club_09_booking_confirmation")
             return True
         except Exception as exc:
-            log.error(f"Could not set booking duration to {end_time}: {exc}")
-            return False
-
-    async def click_slot(self, page: Page, booking_time: str) -> bool:
-        slot_minutes = self.booking_minutes(booking_time)
-        any_sel = f'a.book-interval.not-booked[data-test-id$="|{slot_minutes}"]'
-        try:
-            await page.wait_for_selector(any_sel, timeout=20_000)
-        except Exception:
-            log.error(f"No slot at {booking_time}")
-            await self.shot(page, "club_06_no_slot_found")
-            return False
-
-        if self.preferred_courts:
-            for court_num in self.preferred_courts:
-                resource_id = self.resource_ids_by_court.get(court_num)
-                if not resource_id:
-                    continue
-                selector = (
-                    f'a.book-interval.not-booked[data-test-id^="booking-{resource_id}"]'
-                    f'[data-test-id$="|{slot_minutes}"]'
-                )
-                el = await page.query_selector(selector)
-                if el:
-                    await el.click()
-                    log.info(f"Preferred slot clicked at {booking_time} (court {court_num})")
-                    await self.shot(page, "club_06_clicked_slot")
-                    return await self.select_duration(page, booking_time)
-
-            log.error(f"No preferred court slot found at {booking_time} for courts {self.preferred_courts}")
-            await self.shot(page, "club_06_no_slot_found")
-            return False
-
-        fallback = await page.query_selector(any_sel)
-        if not fallback:
-            log.error(f"No clickable slot found at {booking_time}")
-            await self.shot(page, "club_06_no_slot_found")
-            return False
-
-        await fallback.click()
-        log.info(f"Fallback slot clicked at {booking_time}")
-        await self.shot(page, "club_06_clicked_slot")
-        return await self.select_duration(page, booking_time)
-
-    async def confirm_popup(self, page: Page) -> bool:
-        try:
-            await page.wait_for_selector("#submit-booking", timeout=8_000)
-            await self.shot(page, "club_08_popup")
-        except Exception:
-            log.error("'Continue booking' not found")
-            return False
-
-        await self.dismiss_cookie_banner(page)
-        await page.click("#submit-booking")
-        log.info("Continue booking clicked")
-
-        try:
-            await page.wait_for_selector("#paynow", timeout=20_000)
-        except Exception:
             try:
-                await page.wait_for_url("**/Booking/Book**", timeout=5_000)
-                await page.wait_for_selector("#paynow", timeout=15_000)
-            except Exception as exc:
-                log.error(f"Booking confirmation did not appear after Continue booking: {exc}")
-                await self.shot(page, "club_09_confirmation_error", full_page=False)
-                return False
-
-        await self.shot(page, "club_09_booking_confirmation")
-        return True
-
-    async def payment_state(self, page: Page) -> tuple[str, str]:
-        confirmation_selector = (
-            "h1:has-text('Confirmed'), h2:has-text('Confirmed'), "
-            "h1:has-text('Thank you'), p:has-text('successfully booked'), "
-            ".booking-confirmed, .alert-success"
-        )
-        loading_selector = (
-            ".loading, .spinner, .loading-spinner, .cs-loading, .blockUI, "
-            "[aria-busy='true'], [data-testid*='loading']"
-        )
-        paynow = page.locator("#paynow").first
-        await self.dismiss_cookie_banner(page)
-        try:
-            if await page.locator(confirmation_selector).first.is_visible(timeout=250):
-                return "confirmed", "confirmation page visible"
-        except Exception:
-            pass
-        if await self.stripe_is_ready(page):
-            return "stripe_ready", "stripe elements detected"
-        fatal_texts = [
-            "something went wrong",
-            "payment failed",
-            "unable to process",
-            "session expired",
-            "try again later",
-            "technical issue",
-            "error",
-        ]
-        try:
-            body_text = (await page.locator("body").inner_text(timeout=500)).lower()
-        except Exception:
-            body_text = ""
-        messages = await self.visible_messages(page)
-        if messages:
-            error_like = [
-                message for message in messages
-                if any(word in message.lower() for word in ["error", "failed", "unable", "required", "select", "choose"])
-            ]
-            if error_like:
-                return "fatal_error", error_like[0]
-        for text in fatal_texts:
-            if text in body_text:
-                return "fatal_error", text
-        try:
-            if await page.locator(loading_selector).first.is_visible(timeout=250):
-                return "loading", "visible loading indicator"
-        except Exception:
-            pass
-        if any(text in body_text for text in ["loading", "processing", "please wait", "creating payment"]):
-            return "loading", "page text indicates payment is still loading"
-        visible, disabled, classes = await self.paynow_status(page)
-        if visible:
-            if disabled is not None:
-                return "loading", f"confirm and pay button is disabled ({disabled})"
-            if classes and "disabled" in classes.lower():
-                return "loading", f"confirm and pay button class indicates disabled ({classes})"
-            if messages:
-                return "paynow_visible", f"confirm and pay still visible; messages={messages[0]}"
-            return "paynow_visible", "confirm and pay button still visible"
-        return "waiting", "payment session pending"
-
-    async def wait_for_payment_ready(self, page: Page) -> str:
-        deadline = monotonic() + 180
-        last_log_at = 0.0
-        retried_paynow = False
-        paynow = page.locator("#paynow").first
-        while monotonic() < deadline:
-            state, detail = await self.payment_state(page)
-            now = monotonic()
-            if state == "stripe_ready":
-                log.info("Stripe session ready")
-                return "stripe_ready"
-            if state == "confirmed":
-                log.info("Booking confirmed before Stripe form appeared")
-                return "confirmed"
-            if state == "fatal_error":
-                log.error(f"Payment page reported an error: {detail}")
-                await self.shot(page, "club_10_payment_error", full_page=False)
-                return "fatal_error"
-            if state == "paynow_visible" and not retried_paynow and now + 30 < deadline:
-                try:
-                    await paynow.click(force=True, timeout=5_000)
-                    retried_paynow = True
-                    log.warning("Payment session did not advance; retried Confirm and pay once")
-                except Exception as exc:
-                    log.warning(f"Could not retry Confirm and pay: {exc}")
-            if now - last_log_at >= 5:
-                log.info(f"Waiting for payment session: {state} ({detail})")
-                last_log_at = now
-            await asyncio.sleep(0.5)
-        try:
-            url = page.url
-        except Exception:
-            url = "<unavailable>"
-        try:
-            body = (await page.locator("body").inner_text(timeout=1_000))[:400].replace("\n", " ")
-        except Exception:
-            body = "<could not read page text>"
-        messages = await self.visible_messages(page)
-        visible, disabled, classes = await self.paynow_status(page)
-        log.error(
-            f"Payment session timed out after prolonged wait. url={url} "
-            f"paynow_visible={visible} paynow_disabled={disabled} paynow_classes={classes} "
-            f"messages={messages} body={body}"
-        )
-        await self.shot(page, "club_10_payment_timeout", full_page=False)
-        if self._capture_live_diagnostics and not self._screenshots_enabled:
-            await self.write_screenshot(page, self.live_timeout_shot_path, full_page=False)
-        return "timeout"
+                body = (await page.locator("body").inner_text(timeout=500))[:300].replace("\n", " ")
+            except Exception:
+                body = "<could not read page text>"
+            log.warning(f"Direct booking page did not load cleanly: {exc}. url={url} body={body}")
+            return False
 
     async def wait_for_booking_confirmation(self, page: Page) -> bool:
         deadline = monotonic() + 120
@@ -755,83 +565,441 @@ class ClubSparkSite(BookingSite):
         await self.shot(page, "club_12_unknown")
         return False
 
-    async def pay(self, page: Page, dry_run: bool) -> bool:
+    async def request_verification_token(self, page: Page) -> Optional[str]:
+        locator = page.locator('input[name="__RequestVerificationToken"]').first
         try:
-            await page.wait_for_selector("#paynow", timeout=20_000)
-            await self.dismiss_cookie_banner(page)
-            await page.locator("#paynow").click(force=True)
-            log.info("Confirm and pay clicked")
-            await self.shot(page, "club_10_after_confirm_and_pay", full_page=False)
-        except Exception as exc:
-            log.error(f"'Confirm and pay' not found: {exc}")
-            await self.shot(page, "club_10_pay_error", full_page=False)
-            return False
-
-        payment_state = await self.wait_for_payment_ready(page)
-        if payment_state == "confirmed":
-            return True
-        if payment_state != "stripe_ready":
-            return False
-
-        if not self.card_number:
-            log.error("CARD_NUMBER not set")
-            return False
+            if await locator.count():
+                value = await locator.get_attribute("value")
+                if value:
+                    return value
+                value = await locator.input_value(timeout=500)
+                if value:
+                    return value
+        except Exception:
+            pass
 
         try:
-            await self.fill_stripe_input(
-                page,
-                [
-                    'input[placeholder*="1234"]',
-                    'input[name="cardnumber"]',
-                    'input[autocomplete="cc-number"]',
-                    'input[inputmode="numeric"]',
-                ],
-                self.card_number,
-                "card number",
+            cookies = await page.context.cookies()
+        except Exception:
+            cookies = []
+        for cookie in cookies:
+            if cookie.get("name") == "__RequestVerificationToken" and "clubspark.lta.org.uk" in cookie.get("domain", ""):
+                return cookie.get("value")
+        return None
+
+    async def stripe_runtime(self, page: Page) -> Optional[dict]:
+        key = None
+        stripe_account = None
+        stripe_js_id = None
+        wallet_params = self.latest_network_post_params("merchant-ui-api.stripe.com/elements/wallet-config")
+        key = key or wallet_params.get("key")
+        stripe_account = stripe_account or wallet_params.get("_stripe_account")
+        stripe_js_id = stripe_js_id or wallet_params.get("stripe_js_id")
+        if not key or not stripe_account:
+            iframe_runtime = await self.stripe_runtime_from_iframes(page)
+            if iframe_runtime:
+                key = key or iframe_runtime.get("key")
+                stripe_account = stripe_account or iframe_runtime.get("stripe_account")
+                stripe_js_id = stripe_js_id or iframe_runtime.get("stripe_js_id")
+        if not key or not stripe_account:
+            html_runtime = await self.stripe_runtime_from_page(page)
+            if html_runtime:
+                key = key or html_runtime.get("key")
+                stripe_account = stripe_account or html_runtime.get("stripe_account")
+        if not key or not stripe_account:
+            return None
+
+        tracking = self.latest_network_response_json("m.stripe.com/6") or {}
+        cookies = await page.context.cookies()
+        cookie_map = {cookie.get("name"): cookie.get("value") for cookie in cookies}
+
+        return {
+            "key": key,
+            "stripe_account": stripe_account,
+            "stripe_js_id": stripe_js_id,
+            "guid": tracking.get("guid"),
+            "muid": cookie_map.get("__stripe_mid") or tracking.get("muid"),
+            "sid": cookie_map.get("__stripe_sid") or tracking.get("sid"),
+        }
+
+    async def stripe_runtime_from_iframes(self, page: Page) -> Optional[dict]:
+        frame_sources = await page.locator('iframe[src*="js.stripe.com"]').evaluate_all(
+            """frames => frames
+                .map(frame => frame.getAttribute('src') || '')
+                .filter(Boolean)"""
+        )
+        key = None
+        stripe_account = None
+        stripe_js_id = None
+        for source in frame_sources:
+            parsed = urlsplit(source)
+            raw_parts = [parsed.query, parsed.fragment]
+            for raw in raw_parts:
+                if not raw:
+                    continue
+                params = parse_qs(raw, keep_blank_values=True)
+                if not key:
+                    key = params.get("key", [None])[-1] or params.get("apiKey", [None])[-1]
+                if not stripe_account:
+                    stripe_account = params.get("stripeAccount", [None])[-1] or params.get("_stripe_account", [None])[-1]
+                if not stripe_js_id:
+                    stripe_js_id = (
+                        params.get("controllerId", [None])[-1]
+                        or params.get("clientSessionId", [None])[-1]
+                        or params.get("client_session_id", [None])[-1]
+                    )
+            if key and stripe_account:
+                return {
+                    "key": key,
+                    "stripe_account": stripe_account,
+                    "stripe_js_id": stripe_js_id,
+                }
+        return None
+
+    async def stripe_runtime_from_page(self, page: Page) -> Optional[dict]:
+        try:
+            content = await page.content()
+        except Exception:
+            return None
+
+        return self.stripe_runtime_from_content(content)
+
+    async def wait_for_stripe_runtime(
+        self,
+        page: Page,
+        timeout_seconds: float = 8.0,
+        poll_interval: float = 0.1,
+    ) -> Optional[dict]:
+        deadline = monotonic() + max(timeout_seconds, 0.0)
+        while True:
+            runtime = await self.stripe_runtime(page)
+            if runtime:
+                return runtime
+            if monotonic() >= deadline:
+                return None
+            await asyncio.sleep(poll_interval)
+
+    async def log_stripe_runtime_diagnostics(self, page: Page) -> None:
+        try:
+            frame_sources = await page.locator('iframe[src*="js.stripe.com"]').evaluate_all(
+                """frames => frames
+                    .map(frame => frame.getAttribute('src') || '')
+                    .filter(Boolean)
+                    .slice(0, 3)"""
             )
-            await self.fill_stripe_input(
-                page,
-                [
-                    'input[placeholder*="MM"]',
-                    'input[name="exp-date"]',
-                    'input[autocomplete="cc-exp"]',
-                ],
-                self.card_expiry,
-                "expiry",
+        except Exception:
+            frame_sources = []
+        try:
+            cookies = await page.context.cookies()
+            cookie_names = sorted(
+                cookie.get("name")
+                for cookie in cookies
+                if "stripe" in cookie.get("name", "").lower()
             )
-            await self.fill_stripe_input(
-                page,
-                [
-                    'input[name="cvc"]',
-                    'input[placeholder*="CVC"]',
-                    'input[autocomplete="cc-csc"]',
-                ],
-                self.card_cvv,
-                "CVC",
-            )
-            log.info("Card filled")
-            await asyncio.sleep(1)
-            # Stripe/modal pages are not reliable screenshot targets.
-            await self.shot(page, "club_11_card_filled", full_page=False)
-        except Exception as exc:
-            log.error(f"Card fill failed: {exc}")
+        except Exception:
+            cookie_names = []
+        log.warning(
+            f"Stripe runtime diagnostics: iframe_count={len(frame_sources)} "
+            f"iframe_srcs={frame_sources} stripe_cookies={cookie_names}"
+        )
+
+    def card_expiry_parts(self) -> tuple[str, str]:
+        digits = "".join(char for char in self.card_expiry if char.isdigit())
+        if len(digits) < 4:
+            raise RuntimeError("CARD_EXPIRY must contain MMYY or MM/YY")
+        return digits[:2], digits[-2:]
+
+    async def create_stripe_payment_method_direct(
+        self,
+        page: Page,
+        current_user: dict,
+        runtime_wait_seconds: float = 8.0,
+    ) -> Optional[str]:
+        if not self.card_number or not self.card_expiry or not self.card_cvv:
+            log.error("CARD_NUMBER, CARD_EXPIRY, and CARD_CVV must be set for direct payment")
+            return None
+
+        runtime = await self.wait_for_stripe_runtime(
+            page,
+            timeout_seconds=runtime_wait_seconds,
+        )
+        if not runtime:
+            log.error("Direct submit unavailable: missing Stripe runtime metadata")
+            await self.log_stripe_runtime_diagnostics(page)
+            return None
+
+        exp_month, exp_year = self.card_expiry_parts()
+        card_number = "".join(char for char in self.card_number if char.isdigit())
+        cvc = "".join(char for char in self.card_cvv if char.isdigit())
+        form = {
+            "type": "card",
+            "billing_details[name]": f"{current_user['first_name']} {current_user['last_name']}".strip(),
+            "billing_details[email]": current_user.get("email", ""),
+            "card[number]": card_number,
+            "card[cvc]": cvc,
+            "card[exp_month]": exp_month,
+            "card[exp_year]": exp_year,
+            "key": runtime["key"],
+            "_stripe_account": runtime["stripe_account"],
+            "referrer": self.api_base_url,
+            "client_attribution_metadata[merchant_integration_source]": "elements",
+            "client_attribution_metadata[merchant_integration_subtype]": "split-card-element",
+            "client_attribution_metadata[merchant_integration_version]": "2017",
+        }
+        if runtime.get("guid"):
+            form["guid"] = runtime["guid"]
+        if runtime.get("muid"):
+            form["muid"] = runtime["muid"]
+        if runtime.get("sid"):
+            form["sid"] = runtime["sid"]
+        if runtime.get("stripe_js_id"):
+            form["client_attribution_metadata[client_session_id]"] = runtime["stripe_js_id"]
+
+        response = await page.context.request.post(
+            "https://api.stripe.com/v1/payment_methods",
+            form=form,
+            headers={
+                "accept": "application/json",
+                "content-type": "application/x-www-form-urlencoded",
+                "origin": "https://js.stripe.com",
+                "referer": "https://js.stripe.com/",
+            },
+            timeout=10_000,
+            fail_on_status_code=False,
+            max_redirects=0,
+        )
+        try:
+            payload = await response.json()
+        except Exception:
+            payload = {}
+
+        if response.status != 200:
+            detail = payload.get("error", {}).get("message") or response.status_text
+            log.warning(f"Direct Stripe payment method failed: {detail}")
+            return None
+
+        payment_method_id = payload.get("id")
+        if not payment_method_id:
+            detail = payload.get("error", {}).get("message") or "missing payment method id"
+            log.warning(f"Direct Stripe payment method failed: {detail}")
+            return None
+
+        log.info("Stripe payment method created directly")
+        return payment_method_id
+
+    def booking_description(self, slot: dict, current_user: dict) -> str:
+        venue_name = current_user.get("venue_name", self.venue)
+        display_date = datetime.strptime(slot["date"], "%Y-%m-%d").strftime("%d %b %Y")
+        start_time = self.minutes_to_time(slot["start_time"])
+        end_time = self.minutes_to_time(slot["end_time"])
+        return f"Court booking at {venue_name} for {display_date} {start_time}-{end_time}"
+
+    async def create_booking_payment_direct(
+        self,
+        page: Page,
+        slot: dict,
+        current_user: dict,
+        payment_method_id: str,
+        referer_url: Optional[str] = None,
+    ) -> Optional[str]:
+        payload = {
+            "PaymentMethodId": payment_method_id,
+            "Cost": slot["total_cost"],
+            "VenueID": slot["resource_group_id"],
+            "PaymentParams": '["booking-default"]',
+            "ScopeID": slot["session_id"],
+            "Description": self.booking_description(slot, current_user),
+            "Metadata": None,
+        }
+        response = await page.context.request.post(
+            f"{self.api_base_url}/Payment/CreatePayment/",
+            data=_json.dumps(payload),
+            headers={
+                "accept": "*/*",
+                "content-type": "application/json",
+                "referer": referer_url or page.url,
+            },
+            timeout=10_000,
+            fail_on_status_code=False,
+            max_redirects=0,
+        )
+        try:
+            body_text = await response.text()
+        except Exception:
+            body_text = ""
+        try:
+            data = _json.loads(body_text) if body_text else {}
+        except Exception:
+            data = {}
+
+        if response.status != 200:
+            detail = data.get("Error") or body_text[:200].replace("\n", " ") or response.status_text
+            log.warning(f"Direct CreatePayment failed with status {response.status}: {detail}")
+            return None
+        if data.get("RequiresAction"):
+            log.warning(f"Direct CreatePayment requires additional action: {body_text[:200].replace(chr(10), ' ')}")
+            return None
+        if data.get("Error"):
+            log.warning(f"Direct CreatePayment failed: {data['Error']}")
+            return None
+
+        booking_token = data.get("ID")
+        if not booking_token:
+            log.warning("Direct CreatePayment did not return a booking token")
+            return None
+
+        log.info("ClubSpark payment token created directly")
+        return booking_token
+
+    async def confirm_booking_direct(
+        self,
+        page: Page,
+        slot: dict,
+        current_user: dict,
+        form_token: str,
+        booking_token: str,
+        referer_url: Optional[str] = None,
+    ) -> bool:
+        response = await page.context.request.post(
+            f"{self.base_url}/Booking/ConfirmBooking",
+            form={
+                "SendSMS": "false",
+                "promo-code": "",
+                "__RequestVerificationToken": form_token,
+                "SessionID": slot["session_id"],
+                "ResourceID": slot["resource_id"],
+                "ResourceGroupID": slot["resource_group_id"],
+                "MatchID": "",
+                "RoleID": "",
+                "Date": slot["date"],
+                "StartTime": str(slot["start_time"]),
+                "EndTime": str(slot["end_time"]),
+                "CourtCost": self.money_text(slot["court_cost"]),
+                "LightingCost": self.money_text(slot["lighting_cost"]),
+                "MembershipCost": "0",
+                "MembersPrice": "0",
+                "GuestsPrice": "0",
+                "MembersCost": "0",
+                "GuestsCost": "0",
+                "Token": booking_token,
+                "Format": "None",
+                "Source": "",
+                "UseCredits": "False",
+                "TotalCost": self.money_text(slot["total_cost"]),
+                "Contacts[0].VenueContactID": current_user["venue_contact_id"],
+                "Contacts[0].VenueContactName": "",
+                "Contacts[0].IsPrimary": "true",
+                "Contacts[0].IsMember": "False",
+                "Contacts[0].FirstName": current_user["first_name"],
+                "Contacts[0].LastName": current_user["last_name"],
+            },
+            headers={
+                "accept": (
+                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,"
+                    "image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
+                ),
+                "content-type": "application/x-www-form-urlencoded",
+                "referer": referer_url or page.url,
+            },
+            timeout=15_000,
+            fail_on_status_code=False,
+            max_redirects=0,
+        )
+        location = response.headers.get("location", "")
+        if response.status in (301, 302, 303, 307, 308) and location:
+            target = urljoin(self.api_base_url, location)
+            if "BookingUnsuccessful" in target:
+                log.error(f"Direct confirm redirected to BookingUnsuccessful: {target}")
+                try:
+                    await page.goto(target, wait_until="domcontentloaded", timeout=10_000)
+                except Exception:
+                    pass
+                return False
+            try:
+                await page.goto(target, wait_until="domcontentloaded", timeout=10_000)
+            except Exception as exc:
+                log.error(f"Direct confirm redirect could not be opened: {exc}")
+                return False
+            return await self.wait_for_booking_confirmation(page)
+
+        if "BookingUnsuccessful" in response.url:
+            log.error(f"Direct confirm returned BookingUnsuccessful: {response.url}")
             return False
 
+        log.error(f"Direct confirm returned unexpected status {response.status} at {response.url}")
+        return False
+
+    async def submit_payment_via_direct_api(
+        self,
+        page: Page,
+        slot: dict,
+        current_user: dict,
+        runtime_wait_seconds: float = 8.0,
+    ) -> Optional[bool]:
+        form_token = await self.request_verification_token(page)
+        if not form_token:
+            log.error("Direct submit unavailable: missing booking verification token")
+            return None
+
+        referer_url = self.direct_booking_url(slot)
+        payment_method_id = await self.create_stripe_payment_method_direct(
+            page,
+            current_user,
+            runtime_wait_seconds=runtime_wait_seconds,
+        )
+        if not payment_method_id:
+            return None
+
+        booking_token = await self.create_booking_payment_direct(
+            page,
+            slot,
+            current_user,
+            payment_method_id,
+            referer_url=referer_url,
+        )
+        if not booking_token:
+            return None
+
+        log.info("Attempting direct booking confirmation")
+        return await self.confirm_booking_direct(
+            page,
+            slot,
+            current_user,
+            form_token,
+            booking_token,
+            referer_url=referer_url,
+        )
+
+    async def pay(
+        self,
+        page: Page,
+        dry_run: bool,
+        slot: Optional[dict] = None,
+        current_user: Optional[dict] = None,
+    ) -> bool:
         if dry_run:
-            log.info("[DRY-RUN] Stopping before Pay — card filled but not submitted")
+            log.info("[DRY-RUN] Stopping before direct payment and booking submission")
             return True
 
-        pay_button = page.locator(
-            "#cs-stripe-elements-submit-button, button[type='submit']:has-text('Pay')"
-        ).first
-        try:
-            await pay_button.click(force=True, timeout=10_000)
-            log.info("Pay clicked")
-        except Exception as exc:
-            log.error(f"Pay button failed: {exc}")
+        if not slot or not current_user:
+            log.error("Direct submit requires slot and current user details")
             return False
 
-        return await self.wait_for_booking_confirmation(page)
+        log.info("Attempting direct payment and booking submission without opening payment session")
+        direct_result = await self.submit_payment_via_direct_api(
+            page,
+            slot,
+            current_user,
+            runtime_wait_seconds=0.0,
+        )
+        if direct_result is True:
+            return True
+        if direct_result is False:
+            log.error("Direct submit failed after direct booking page load")
+            return False
+
+        log.error("Direct submit path unavailable after direct booking page load")
+        return False
 
     async def run(self, options: RunOptions) -> None:
         self.configure_venue(options.venue_override)
@@ -880,11 +1048,19 @@ class ClubSparkSite(BookingSite):
             net_entries = []
             if options.debug or self._capture_live_diagnostics:
                 net_entries = self.attach_network_logger(page)
-                await self.attach_network_response_logger(page, net_entries)
+                await self.attach_network_response_logger(page, net_entries, capture_bodies=options.debug)
+                self._network_entries = net_entries
 
             try:
                 if not await self.login(page, date):
                     return
+
+                try:
+                    user = await self.get_current_user(page)
+                    current_user = self.venue_contact_for_user(user, "")
+                except Exception as exc:
+                    log.warning(f"Could not load current ClubSpark user: {exc}")
+                    current_user = None
 
                 for pattern in [
                     "**/*.{png,jpg,jpeg,gif,svg,ico,woff,woff2,ttf,eot}",
@@ -911,23 +1087,27 @@ class ClubSparkSite(BookingSite):
                 else:
                     log.info("Skipping release-time wait.")
 
-                slot_available = await self.wait_for_slot_via_api(page, booking_time, date)
-                if not slot_available:
-                    log.error("API booking path did not find a matching slot; stopping without UI fallback")
+                slot = await self.wait_for_slot_via_api(page, booking_time, date)
+                if not slot:
+                    log.error("API booking path did not find a matching slot")
                     return
 
-                log.info("Reloading booking page after API confirmation so the UI reflects the newly released slot")
-                await page.reload(wait_until="commit", timeout=10_000)
-                await page.wait_for_load_state("networkidle", timeout=20_000)
-                await self.dismiss_cookie_banner(page)
+                if current_user is None:
+                    try:
+                        user = await self.get_current_user(page)
+                        current_user = self.venue_contact_for_user(user, slot["resource_group_id"])
+                    except Exception:
+                        current_user = None
 
-                if not await self.click_slot(page, booking_time):
+                if not await self.goto_direct_booking_page(page, slot):
+                    log.error("Direct booking page load failed")
                     return
-
-                if not await self.confirm_popup(page):
-                    return
-
-                await self.pay(page, dry_run=dry_run)
+                await self.pay(
+                    page,
+                    dry_run=dry_run,
+                    slot=slot,
+                    current_user=current_user,
+                )
             finally:
                 if options.debug:
                     self.save_network_log(net_entries)
