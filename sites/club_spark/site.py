@@ -514,12 +514,22 @@ class ClubSparkSite(BookingSite):
             "stripe_js_id": stripe_js_id,
         }
 
+    def booking_unsuccessful_reason(self, url: str) -> Optional[str]:
+        if "BookingUnsuccessful" not in url:
+            return None
+        parsed = urlsplit(url)
+        params = parse_qs(parsed.query, keep_blank_values=True)
+        return params.get("reason", ["unknown"])[-1] or "unknown"
+
     async def goto_direct_booking_page(self, page: Page, slot: dict) -> bool:
         url = self.direct_booking_url(slot)
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=10_000)
             await self.dismiss_cookie_banner(page)
-            await page.wait_for_selector("#paynow", timeout=5_000)
+            rejection_reason = self.booking_unsuccessful_reason(page.url)
+            if rejection_reason:
+                log.error(f"Direct booking page rejected by ClubSpark: reason={rejection_reason} url={page.url}")
+                return False
             log.info("Direct booking page loaded")
             await self.shot(page, "club_09_booking_confirmation")
             return True
@@ -586,6 +596,26 @@ class ClubSparkSite(BookingSite):
             if cookie.get("name") == "__RequestVerificationToken" and "clubspark.lta.org.uk" in cookie.get("domain", ""):
                 return cookie.get("value")
         return None
+
+    async def wait_for_direct_submit_prerequisites(
+        self,
+        page: Page,
+        timeout_seconds: float = 0.0,
+        poll_interval: float = 0.05,
+    ) -> tuple[Optional[str], Optional[dict]]:
+        deadline = monotonic() + max(timeout_seconds, 0.0)
+        form_token = None
+        runtime = None
+        while True:
+            if not form_token:
+                form_token = await self.request_verification_token(page)
+            if not runtime:
+                runtime = await self.stripe_runtime(page)
+            if form_token and runtime:
+                return form_token, runtime
+            if monotonic() >= deadline:
+                return form_token, runtime
+            await asyncio.sleep(poll_interval)
 
     async def stripe_runtime(self, page: Page) -> Optional[dict]:
         key = None
@@ -713,13 +743,14 @@ class ClubSparkSite(BookingSite):
         self,
         page: Page,
         current_user: dict,
+        runtime: Optional[dict] = None,
         runtime_wait_seconds: float = 8.0,
     ) -> Optional[str]:
         if not self.card_number or not self.card_expiry or not self.card_cvv:
             log.error("CARD_NUMBER, CARD_EXPIRY, and CARD_CVV must be set for direct payment")
             return None
 
-        runtime = await self.wait_for_stripe_runtime(
+        runtime = runtime or await self.wait_for_stripe_runtime(
             page,
             timeout_seconds=runtime_wait_seconds,
         )
@@ -934,9 +965,11 @@ class ClubSparkSite(BookingSite):
         page: Page,
         slot: dict,
         current_user: dict,
+        form_token: Optional[str] = None,
+        runtime: Optional[dict] = None,
         runtime_wait_seconds: float = 8.0,
     ) -> Optional[bool]:
-        form_token = await self.request_verification_token(page)
+        form_token = form_token or await self.request_verification_token(page)
         if not form_token:
             log.error("Direct submit unavailable: missing booking verification token")
             return None
@@ -945,6 +978,7 @@ class ClubSparkSite(BookingSite):
         payment_method_id = await self.create_stripe_payment_method_direct(
             page,
             current_user,
+            runtime=runtime,
             runtime_wait_seconds=runtime_wait_seconds,
         )
         if not payment_method_id:
@@ -986,10 +1020,29 @@ class ClubSparkSite(BookingSite):
             return False
 
         log.info("Attempting direct payment and booking submission without opening payment session")
+        form_token, runtime = await self.wait_for_direct_submit_prerequisites(page, timeout_seconds=0.0)
+        if not form_token or not runtime:
+            log.info("Direct submit prerequisites not ready immediately; retrying briefly")
+            form_token, runtime = await self.wait_for_direct_submit_prerequisites(page, timeout_seconds=0.35)
+
+        rejection_reason = self.booking_unsuccessful_reason(page.url)
+        if rejection_reason:
+            log.error(f"Direct booking page rejected by ClubSpark: reason={rejection_reason} url={page.url}")
+            return False
+        if not form_token:
+            log.error("Direct submit unavailable after direct booking page load: missing booking verification token")
+            return False
+        if not runtime:
+            log.error("Direct submit unavailable after direct booking page load: missing Stripe runtime metadata")
+            await self.log_stripe_runtime_diagnostics(page)
+            return False
+
         direct_result = await self.submit_payment_via_direct_api(
             page,
             slot,
             current_user,
+            form_token=form_token,
+            runtime=runtime,
             runtime_wait_seconds=0.0,
         )
         if direct_result is True:
