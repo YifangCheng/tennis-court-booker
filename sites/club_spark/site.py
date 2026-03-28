@@ -1,4 +1,5 @@
 import asyncio
+import html as _html
 import json as _json
 import os
 import re
@@ -48,6 +49,18 @@ class ClubSparkSite(BookingSite):
         self.card_number = os.environ.get("CARD_NUMBER", "")
         self.card_expiry = os.environ.get("CARD_EXPIRY", "")
         self.card_cvv = os.environ.get("CARD_CVV", "")
+        self.precreate_stripe_pm_enabled = os.environ.get("CLUB_SPARK_PRECREATE_STRIPE_PM", "").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        self.precreate_stripe_pm_lead_seconds = float(
+            os.environ.get("CLUB_SPARK_PRECREATE_STRIPE_PM_LEAD_SECONDS", "15")
+        )
+        self.precreated_stripe_pm_max_age_seconds = float(
+            os.environ.get("CLUB_SPARK_PRECREATED_STRIPE_PM_MAX_AGE_SECONDS", "90")
+        )
 
         self.api_base_url = "https://clubspark.lta.org.uk"
         self.venue = ""
@@ -187,7 +200,12 @@ class ClubSparkSite(BookingSite):
         def _on_request(request) -> None:
             is_xhr = request.resource_type in ("xhr", "fetch")
             is_post_doc = request.resource_type == "document" and request.method != "GET"
-            if not (is_xhr or is_post_doc):
+            is_direct_booking_doc = (
+                request.resource_type == "document"
+                and request.method == "GET"
+                and "/Booking/Book?" in request.url
+            )
+            if not (is_xhr or is_post_doc or is_direct_booking_doc):
                 return
             try:
                 body = request.post_data
@@ -222,7 +240,12 @@ class ClubSparkSite(BookingSite):
                 req = response.request
                 is_xhr = req.resource_type in ("xhr", "fetch")
                 is_post_doc = req.resource_type == "document" and req.method != "GET"
-                if not (is_xhr or is_post_doc):
+                is_direct_booking_doc = (
+                    req.resource_type == "document"
+                    and req.method == "GET"
+                    and "/Booking/Book?" in req.url
+                )
+                if not (is_xhr or is_post_doc or is_direct_booking_doc):
                     return
                 body = None
                 if capture_bodies:
@@ -330,9 +353,14 @@ class ClubSparkSite(BookingSite):
         return None
 
     def session_is_available(self, session: dict, start_minutes: int) -> bool:
-        if session.get("Category") != 0:
+        if not self.session_matches_time(session, start_minutes):
             return False
         if session.get("Capacity", 0) <= 0:
+            return False
+        return True
+
+    def session_matches_time(self, session: dict, start_minutes: int) -> bool:
+        if session.get("Category") != 0:
             return False
         session_start = int(session.get("StartTime", -1))
         session_end = int(session.get("EndTime", -1))
@@ -342,7 +370,7 @@ class ClubSparkSite(BookingSite):
             return False
         return True
 
-    def find_slot_from_sessions(self, sessions: dict, booking_time: str):
+    def find_slot_from_sessions(self, sessions: dict, booking_time: str, require_availability: bool = True):
         start_minutes = self.booking_minutes(booking_time)
         resources = sessions.get("Resources", [])
 
@@ -360,7 +388,12 @@ class ClubSparkSite(BookingSite):
         for resource in ordered_resources:
             for day in resource.get("Days", []):
                 for session in day.get("Sessions", []):
-                    if self.session_is_available(session, start_minutes):
+                    matches = (
+                        self.session_is_available(session, start_minutes)
+                        if require_availability
+                        else self.session_matches_time(session, start_minutes)
+                    )
+                    if matches:
                         return resource, session
 
         return None, None
@@ -379,6 +412,23 @@ class ClubSparkSite(BookingSite):
 
         log.info(
             f"API slot found at {booking_time} on resource {resource['ID']} (session {session['ID']})"
+        )
+        return self.build_slot_details(resource, session, date, booking_time)
+
+    async def prefetch_slot_candidate(self, page: Page, booking_time: str, date: str) -> Optional[dict]:
+        try:
+            sessions = await self.get_venue_sessions(page, date)
+        except Exception as exc:
+            log.warning(f"Could not prefetch ClubSpark slot candidate: {exc}")
+            return None
+
+        resource, session = self.find_slot_from_sessions(sessions, booking_time, require_availability=False)
+        if not resource or not session:
+            log.warning(f"Could not prefetch slot candidate at {booking_time}")
+            return None
+
+        log.info(
+            f"Prefetched slot candidate at {booking_time} on resource {resource['ID']} (session {session['ID']})"
         )
         return self.build_slot_details(resource, session, date, booking_time)
 
@@ -521,6 +571,55 @@ class ClubSparkSite(BookingSite):
         params = parse_qs(parsed.query, keep_blank_values=True)
         return params.get("reason", ["unknown"])[-1] or "unknown"
 
+    def input_value_from_html(self, content: str, name: str) -> Optional[str]:
+        patterns = [
+            rf'<input[^>]*name=["\']{re.escape(name)}["\'][^>]*value=["\']([^"\']+)["\']',
+            rf'<input[^>]*value=["\']([^"\']+)["\'][^>]*name=["\']{re.escape(name)}["\']',
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, content, flags=re.IGNORECASE)
+            if match:
+                return _html.unescape(match.group(1))
+        return None
+
+    async def fetch_direct_booking_bootstrap(self, page: Page, slot: dict) -> Optional[dict]:
+        url = self.direct_booking_url(slot)
+        try:
+            response = await page.context.request.get(
+                url,
+                headers={
+                    "accept": (
+                        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,"
+                        "image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
+                    ),
+                    "referer": self.booking_url_for(slot["date"]),
+                },
+                timeout=10_000,
+                fail_on_status_code=False,
+            )
+        except Exception:
+            return None
+
+        try:
+            content = await response.text()
+        except Exception:
+            content = ""
+
+        if response.status != 200:
+            return {
+                "response_url": response.url,
+                "rejection_reason": self.booking_unsuccessful_reason(response.url),
+                "verification_token": None,
+                "stripe_runtime": None,
+            }
+
+        return {
+            "response_url": response.url,
+            "rejection_reason": self.booking_unsuccessful_reason(response.url),
+            "verification_token": self.input_value_from_html(content, "__RequestVerificationToken"),
+            "stripe_runtime": self.stripe_runtime_from_content(content),
+        }
+
     async def goto_direct_booking_page(self, page: Page, slot: dict) -> bool:
         url = self.direct_booking_url(slot)
         try:
@@ -540,6 +639,92 @@ class ClubSparkSite(BookingSite):
                 body = "<could not read page text>"
             log.warning(f"Direct booking page did not load cleanly: {exc}. url={url} body={body}")
             return False
+
+    async def prepare_direct_booking(self, page: Page, slot: dict) -> Optional[dict]:
+        bootstrap_task = asyncio.create_task(self.fetch_direct_booking_bootstrap(page, slot))
+        page_task = asyncio.create_task(self.goto_direct_booking_page(page, slot))
+        booking_bootstrap = None
+        page_loaded = False
+
+        while True:
+            pending_tasks = [task for task in (bootstrap_task, page_task) if task is not None]
+            if not pending_tasks:
+                break
+
+            done, _ = await asyncio.wait(pending_tasks, return_when=asyncio.FIRST_COMPLETED)
+
+            if bootstrap_task in done:
+                try:
+                    booking_bootstrap = bootstrap_task.result()
+                except Exception:
+                    booking_bootstrap = None
+                bootstrap_task = None
+
+                rejection_reason = (booking_bootstrap or {}).get("rejection_reason")
+                if rejection_reason:
+                    if page_task is not None and not page_task.done():
+                        page_task.cancel()
+                        try:
+                            await page_task
+                        except asyncio.CancelledError:
+                            pass
+                        except Exception:
+                            pass
+                    log.error(
+                        "Direct booking bootstrap rejected by ClubSpark: "
+                        f"reason={rejection_reason} url={(booking_bootstrap or {}).get('response_url')}"
+                    )
+                    return None
+
+                bootstrap_token = (booking_bootstrap or {}).get("verification_token")
+                bootstrap_runtime = (booking_bootstrap or {}).get("stripe_runtime")
+                if bootstrap_token and bootstrap_runtime:
+                    if page_task is not None and not page_task.done():
+                        page_task.cancel()
+                        try:
+                            await page_task
+                        except asyncio.CancelledError:
+                            pass
+                        except Exception:
+                            pass
+                    log.info("Direct booking bootstrap won the race; skipping booking page navigation")
+                    return booking_bootstrap
+
+            if page_task in done:
+                try:
+                    page_loaded = page_task.result()
+                except Exception:
+                    page_loaded = False
+                page_task = None
+
+                if page_loaded:
+                    if bootstrap_task is not None:
+                        if bootstrap_task.done():
+                            try:
+                                booking_bootstrap = bootstrap_task.result()
+                            except Exception:
+                                booking_bootstrap = None
+                        else:
+                            bootstrap_task.cancel()
+                            try:
+                                await bootstrap_task
+                            except asyncio.CancelledError:
+                                pass
+                            except Exception:
+                                pass
+                    return booking_bootstrap
+
+                if bootstrap_task is None:
+                    break
+
+        bootstrap_token = (booking_bootstrap or {}).get("verification_token")
+        bootstrap_runtime = (booking_bootstrap or {}).get("stripe_runtime")
+        if bootstrap_token and bootstrap_runtime:
+            log.warning("Direct booking page load timed out; continuing with request bootstrap")
+            return booking_bootstrap
+
+        log.error("Direct booking page load failed")
+        return None
 
     async def wait_for_booking_confirmation(self, page: Page) -> bool:
         deadline = monotonic() + 120
@@ -825,6 +1010,57 @@ class ClubSparkSite(BookingSite):
         end_time = self.minutes_to_time(slot["end_time"])
         return f"Court booking at {venue_name} for {display_date} {start_time}-{end_time}"
 
+    async def precreate_stripe_payment_method(
+        self,
+        page: Page,
+        slot: dict,
+        current_user: dict,
+    ) -> Optional[dict]:
+        booking_bootstrap = await self.fetch_direct_booking_bootstrap(page, slot)
+        rejection_reason = (booking_bootstrap or {}).get("rejection_reason")
+        if rejection_reason:
+            log.warning(
+                "Stripe payment method precreation skipped: "
+                f"booking bootstrap rejected with reason={rejection_reason}"
+            )
+            return None
+
+        runtime = (booking_bootstrap or {}).get("stripe_runtime")
+        if not runtime:
+            log.warning("Stripe payment method precreation skipped: no Stripe runtime before release")
+            return None
+
+        payment_method_id = await self.create_stripe_payment_method_direct(
+            page,
+            current_user,
+            runtime=runtime,
+            runtime_wait_seconds=0.0,
+        )
+        if not payment_method_id:
+            log.warning("Stripe payment method precreation failed")
+            return None
+
+        log.info("Stripe payment method precreated before release")
+        return {
+            "payment_method_id": payment_method_id,
+            "created_at_monotonic": monotonic(),
+        }
+
+    def usable_precreated_stripe_payment_method(self, precreated_payment_method: Optional[dict]) -> Optional[str]:
+        if not precreated_payment_method:
+            return None
+        payment_method_id = precreated_payment_method.get("payment_method_id")
+        created_at = precreated_payment_method.get("created_at_monotonic")
+        if not payment_method_id or created_at is None:
+            return None
+        age_seconds = monotonic() - created_at
+        if age_seconds > self.precreated_stripe_pm_max_age_seconds:
+            log.warning(
+                f"Precreated Stripe payment method expired after {age_seconds:.1f}s; creating a fresh one"
+            )
+            return None
+        return payment_method_id
+
     async def create_booking_payment_direct(
         self,
         page: Page,
@@ -967,6 +1203,7 @@ class ClubSparkSite(BookingSite):
         current_user: dict,
         form_token: Optional[str] = None,
         runtime: Optional[dict] = None,
+        payment_method_id_override: Optional[str] = None,
         runtime_wait_seconds: float = 8.0,
     ) -> Optional[bool]:
         form_token = form_token or await self.request_verification_token(page)
@@ -975,12 +1212,16 @@ class ClubSparkSite(BookingSite):
             return None
 
         referer_url = self.direct_booking_url(slot)
-        payment_method_id = await self.create_stripe_payment_method_direct(
-            page,
-            current_user,
-            runtime=runtime,
-            runtime_wait_seconds=runtime_wait_seconds,
-        )
+        payment_method_id = payment_method_id_override
+        if payment_method_id:
+            log.info("Using precreated Stripe payment method")
+        else:
+            payment_method_id = await self.create_stripe_payment_method_direct(
+                page,
+                current_user,
+                runtime=runtime,
+                runtime_wait_seconds=runtime_wait_seconds,
+            )
         if not payment_method_id:
             return None
 
@@ -1010,6 +1251,9 @@ class ClubSparkSite(BookingSite):
         dry_run: bool,
         slot: Optional[dict] = None,
         current_user: Optional[dict] = None,
+        form_token_override: Optional[str] = None,
+        runtime_override: Optional[dict] = None,
+        precreated_payment_method: Optional[dict] = None,
     ) -> bool:
         if dry_run:
             log.info("[DRY-RUN] Stopping before direct payment and booking submission")
@@ -1020,10 +1264,17 @@ class ClubSparkSite(BookingSite):
             return False
 
         log.info("Attempting direct payment and booking submission without opening payment session")
-        form_token, runtime = await self.wait_for_direct_submit_prerequisites(page, timeout_seconds=0.0)
+        form_token = form_token_override
+        runtime = runtime_override
+        if not form_token or not runtime:
+            page_form_token, page_runtime = await self.wait_for_direct_submit_prerequisites(page, timeout_seconds=0.0)
+            form_token = form_token or page_form_token
+            runtime = runtime or page_runtime
         if not form_token or not runtime:
             log.info("Direct submit prerequisites not ready immediately; retrying briefly")
-            form_token, runtime = await self.wait_for_direct_submit_prerequisites(page, timeout_seconds=0.35)
+            page_form_token, page_runtime = await self.wait_for_direct_submit_prerequisites(page, timeout_seconds=0.35)
+            form_token = form_token or page_form_token
+            runtime = runtime or page_runtime
 
         rejection_reason = self.booking_unsuccessful_reason(page.url)
         if rejection_reason:
@@ -1037,14 +1288,27 @@ class ClubSparkSite(BookingSite):
             await self.log_stripe_runtime_diagnostics(page)
             return False
 
+        payment_method_id_override = self.usable_precreated_stripe_payment_method(precreated_payment_method)
         direct_result = await self.submit_payment_via_direct_api(
             page,
             slot,
             current_user,
             form_token=form_token,
             runtime=runtime,
+            payment_method_id_override=payment_method_id_override,
             runtime_wait_seconds=0.0,
         )
+        if direct_result is None and payment_method_id_override:
+            log.warning("Precreated Stripe payment method path failed; retrying with a fresh Stripe payment method")
+            direct_result = await self.submit_payment_via_direct_api(
+                page,
+                slot,
+                current_user,
+                form_token=form_token,
+                runtime=runtime,
+                payment_method_id_override=None,
+                runtime_wait_seconds=0.0,
+            )
         if direct_result is True:
             return True
         if direct_result is False:
@@ -1053,6 +1317,101 @@ class ClubSparkSite(BookingSite):
 
         log.error("Direct submit path unavailable after direct booking page load")
         return False
+
+    async def wait_until_release(self, timing: TimingHelper, release_time: datetime, options: RunOptions) -> None:
+        if not options.skip_wait and not options.debug:
+            remaining = timing.secs_until(release_time)
+            if remaining > 0:
+                log.info(f"Waiting {remaining:.1f}s")
+                while True:
+                    remaining = timing.secs_until(release_time)
+                    if remaining <= 0.2:
+                        break
+                    await asyncio.sleep(min(remaining - 0.2, 1.0))
+                while timing.secs_until(release_time) > 0:
+                    pass
+            log.info(">>> RELEASE TIME <<<")
+        else:
+            log.info("Skipping release-time wait.")
+
+    async def maybe_precreate_payment_method(
+        self,
+        page: Page,
+        prefetched_slot: Optional[dict],
+        current_user: Optional[dict],
+        timing: TimingHelper,
+        release_time: datetime,
+        options: RunOptions,
+    ) -> Optional[dict]:
+        if not self.precreate_stripe_pm_enabled or prefetched_slot is None or current_user is None:
+            return None
+
+        if options.skip_wait or options.debug:
+            log.info("Precreating Stripe payment method immediately for test mode")
+            return await self.precreate_stripe_payment_method(page, prefetched_slot, current_user)
+
+        precreate_lead_seconds = max(0.0, self.precreate_stripe_pm_lead_seconds)
+        seconds_until_precreate = timing.secs_until(release_time) - precreate_lead_seconds
+        if seconds_until_precreate > 0:
+            log.info(f"Waiting {seconds_until_precreate:.1f}s before Stripe payment method precreation")
+            await asyncio.sleep(seconds_until_precreate)
+
+        return await self.precreate_stripe_payment_method(page, prefetched_slot, current_user)
+
+    async def resolve_slot_and_bootstrap(
+        self,
+        page: Page,
+        booking_time: str,
+        date: str,
+        prefetched_slot: Optional[dict],
+    ) -> tuple[Optional[dict], Optional[dict]]:
+        slot_refresh_task = asyncio.create_task(self.wait_for_slot_via_api(page, booking_time, date))
+        slot = prefetched_slot
+        booking_bootstrap = None
+
+        if slot:
+            booking_bootstrap = await self.prepare_direct_booking(page, slot)
+            if booking_bootstrap is None:
+                log.warning("Prefetched slot path failed; waiting for live API slot")
+                slot = None
+
+        if slot is None:
+            try:
+                slot = await slot_refresh_task
+            finally:
+                slot_refresh_task = None
+            if not slot:
+                log.error("API booking path did not find a matching slot")
+                return None, None
+            booking_bootstrap = await self.prepare_direct_booking(page, slot)
+            if booking_bootstrap is None:
+                return None, None
+        elif slot_refresh_task is not None:
+            slot_refresh_task.cancel()
+            try:
+                await slot_refresh_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+
+        return slot, booking_bootstrap
+
+    async def ensure_current_user_for_slot(
+        self,
+        page: Page,
+        slot: dict,
+        user: Optional[dict],
+        current_user: Optional[dict],
+    ) -> Optional[dict]:
+        if current_user is not None:
+            return current_user
+        try:
+            if user is None:
+                user = await self.get_current_user(page)
+            return self.venue_contact_for_user(user, slot["resource_group_id"])
+        except Exception:
+            return None
 
     async def run(self, options: RunOptions) -> None:
         self.configure_venue(options.venue_override)
@@ -1105,6 +1464,7 @@ class ClubSparkSite(BookingSite):
                 self._network_entries = net_entries
 
             try:
+                user = None
                 if not await self.login(page, date):
                     return
 
@@ -1124,42 +1484,40 @@ class ClubSparkSite(BookingSite):
                     await page.route(pattern, lambda route: route.abort())
 
                 await self.goto_booking_page(page, date)
+                prefetched_slot = await self.prefetch_slot_candidate(page, booking_time, date)
+                if current_user is None and user is not None and prefetched_slot is not None:
+                    current_user = self.venue_contact_for_user(user, prefetched_slot["resource_group_id"])
 
-                if not options.skip_wait and not options.debug:
-                    remaining = timing.secs_until(release_time)
-                    if remaining > 0:
-                        log.info(f"Waiting {remaining:.1f}s")
-                        while True:
-                            remaining = timing.secs_until(release_time)
-                            if remaining <= 0.2:
-                                break
-                            await asyncio.sleep(min(remaining - 0.2, 1.0))
-                        while timing.secs_until(release_time) > 0:
-                            pass
-                    log.info(">>> RELEASE TIME <<<")
-                else:
-                    log.info("Skipping release-time wait.")
+                precreated_payment_method = await self.maybe_precreate_payment_method(
+                    page,
+                    prefetched_slot,
+                    current_user,
+                    timing,
+                    release_time,
+                    options,
+                )
 
-                slot = await self.wait_for_slot_via_api(page, booking_time, date)
-                if not slot:
-                    log.error("API booking path did not find a matching slot")
+                await self.wait_until_release(timing, release_time, options)
+
+                slot, booking_bootstrap = await self.resolve_slot_and_bootstrap(
+                    page,
+                    booking_time,
+                    date,
+                    prefetched_slot,
+                )
+                if slot is None or booking_bootstrap is None:
                     return
 
-                if current_user is None:
-                    try:
-                        user = await self.get_current_user(page)
-                        current_user = self.venue_contact_for_user(user, slot["resource_group_id"])
-                    except Exception:
-                        current_user = None
+                current_user = await self.ensure_current_user_for_slot(page, slot, user, current_user)
 
-                if not await self.goto_direct_booking_page(page, slot):
-                    log.error("Direct booking page load failed")
-                    return
                 await self.pay(
                     page,
                     dry_run=dry_run,
                     slot=slot,
                     current_user=current_user,
+                    form_token_override=(booking_bootstrap or {}).get("verification_token"),
+                    runtime_override=(booking_bootstrap or {}).get("stripe_runtime"),
+                    precreated_payment_method=precreated_payment_method,
                 )
             finally:
                 if options.debug:

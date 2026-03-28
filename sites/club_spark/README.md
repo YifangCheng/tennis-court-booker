@@ -1,6 +1,6 @@
 # Club Spark
 
-This plugin targets Tanner St Park on ClubSpark. It uses a safer hybrid flow: pre-login, pre-load the target date, use the API to detect when the exact slot is available, then use the UI only for the final click, duration selection, continue-booking step, and payment.
+This plugin targets ClubSpark venues such as Tanner St Park. The current fast path logs in early, preloads the target date, prefetched the likely slot before release, then uses direct ClubSpark and Stripe requests for payment and confirmation instead of the old click-through UI flow.
 
 ## Run Commands
 
@@ -29,9 +29,16 @@ Without `--date`, the plugin targets `today + 7 days`, which matches the site's 
 ## Debug Notes
 
 - Login uses the ClubSpark sign-in link, then the LTA login provider (`value="LTA2"`).
-- Slot discovery uses `GetVenueSessions`, then the UI clicks the exact configured court/time and expands the booking to 1 hour by selecting the end time in the duration dropdown.
+- Slot discovery uses `GetVenueSessions`, and the booking page bootstrap races a raw request against browser navigation.
+- The default hot path is direct Stripe `payment_methods` -> ClubSpark `CreatePayment` -> ClubSpark `ConfirmBooking`.
 - Debug mode writes `network_log.club_spark.json` and `debug_cookies.club_spark.json` in the repository root.
 
 ## API Note
 
-This plugin does not use a full direct-booking API path yet. It uses the API only to detect slot availability, then relies on the normal booking UI for the booking confirmation step. Debug network logging is left enabled so a fuller ClubSpark booking API contract can be investigated later if needed.
+This plugin now uses a direct submit path after release. The remaining browser dependency is the booking-page bootstrap, which is used to obtain the verification token and Stripe runtime data when needed.
+
+## Experimental Speed Mode
+
+- Set `CLUB_SPARK_PRECREATE_STRIPE_PM=1` to precreate the Stripe `payment_method` shortly before release and reuse it after release.
+- `CLUB_SPARK_PRECREATE_STRIPE_PM_LEAD_SECONDS` controls how many seconds before release the precreation attempt runs.
+- `CLUB_SPARK_PRECREATED_STRIPE_PM_MAX_AGE_SECONDS` controls how old the cached Stripe payment method is allowed to be before the bot creates a fresh one.
