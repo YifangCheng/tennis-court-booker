@@ -55,6 +55,12 @@ class ClubSparkSite(BookingSite):
         self.precreated_stripe_pm_max_age_seconds = float(
             os.environ.get("CLUB_SPARK_PRECREATED_STRIPE_PM_MAX_AGE_SECONDS", "90")
         )
+        self.precreate_booking_payment_lead_seconds = float(
+            os.environ.get("CLUB_SPARK_PRECREATE_BOOKING_PAYMENT_LEAD_SECONDS", "3")
+        )
+        self.precreated_booking_payment_max_age_seconds = float(
+            os.environ.get("CLUB_SPARK_PRECREATED_BOOKING_PAYMENT_MAX_AGE_SECONDS", "30")
+        )
         self.request_timeout_ms = int(
             float(os.environ.get("CLUB_SPARK_REQUEST_TIMEOUT_SECONDS", "30")) * 1000
         )
@@ -1010,6 +1016,16 @@ class ClubSparkSite(BookingSite):
         end_time = self.minutes_to_time(slot["end_time"])
         return f"Court booking at {venue_name} for {display_date} {start_time}-{end_time}"
 
+    def slot_signature(self, slot: dict) -> tuple:
+        return (
+            slot.get("date"),
+            slot.get("session_id"),
+            slot.get("resource_id"),
+            slot.get("resource_group_id"),
+            slot.get("start_time"),
+            slot.get("end_time"),
+        )
+
     async def precreate_stripe_payment_method(
         self,
         page: Page,
@@ -1060,6 +1076,57 @@ class ClubSparkSite(BookingSite):
             )
             return None
         return payment_method_id
+
+    async def precreate_booking_payment(
+        self,
+        page: Page,
+        slot: dict,
+        current_user: dict,
+        precreated_payment_method: Optional[dict],
+    ) -> Optional[dict]:
+        payment_method_id = self.usable_precreated_stripe_payment_method(precreated_payment_method)
+        if not payment_method_id:
+            log.warning("ClubSpark payment token precreation skipped: no usable precreated Stripe payment method")
+            return None
+
+        booking_token = await self.create_booking_payment_direct(
+            page,
+            slot,
+            current_user,
+            payment_method_id,
+            referer_url=self.direct_booking_url(slot),
+        )
+        if not booking_token:
+            log.warning("ClubSpark payment token precreation failed")
+            return None
+
+        log.info("ClubSpark payment token precreated before release")
+        return {
+            "booking_token": booking_token,
+            "created_at_monotonic": monotonic(),
+            "slot_signature": self.slot_signature(slot),
+        }
+
+    def usable_precreated_booking_payment(self, slot: dict, precreated_booking_payment: Optional[dict]) -> Optional[str]:
+        if not precreated_booking_payment:
+            return None
+
+        booking_token = precreated_booking_payment.get("booking_token")
+        created_at = precreated_booking_payment.get("created_at_monotonic")
+        slot_signature = precreated_booking_payment.get("slot_signature")
+        if not booking_token or created_at is None:
+            return None
+        if slot_signature != self.slot_signature(slot):
+            log.warning("Precreated ClubSpark payment token does not match the resolved slot; creating a fresh one")
+            return None
+
+        age_seconds = monotonic() - created_at
+        if age_seconds > self.precreated_booking_payment_max_age_seconds:
+            log.warning(
+                f"Precreated ClubSpark payment token expired after {age_seconds:.1f}s; creating a fresh one"
+            )
+            return None
+        return booking_token
 
     async def create_booking_payment_direct(
         self,
@@ -1254,6 +1321,7 @@ class ClubSparkSite(BookingSite):
         form_token_override: Optional[str] = None,
         runtime_override: Optional[dict] = None,
         precreated_payment_method: Optional[dict] = None,
+        precreated_booking_payment: Optional[dict] = None,
     ) -> bool:
         if dry_run:
             log.info("[DRY-RUN] Stopping before direct payment and booking submission")
@@ -1283,6 +1351,22 @@ class ClubSparkSite(BookingSite):
         if not form_token:
             log.error("Direct submit unavailable after direct booking page load: missing booking verification token")
             return False
+
+        precreated_booking_token = self.usable_precreated_booking_payment(slot, precreated_booking_payment)
+        if precreated_booking_token:
+            log.info("Using precreated ClubSpark payment token")
+            log.info("Attempting direct booking confirmation")
+            if await self.confirm_booking_direct(
+                page,
+                slot,
+                current_user,
+                form_token,
+                precreated_booking_token,
+                referer_url=self.direct_booking_url(slot),
+            ):
+                return True
+            log.warning("Precreated ClubSpark payment token path failed; retrying with a fresh ClubSpark payment token")
+
         if not runtime:
             log.error("Direct submit unavailable after direct booking page load: missing Stripe runtime metadata")
             await self.log_stripe_runtime_diagnostics(page)
@@ -1334,6 +1418,45 @@ class ClubSparkSite(BookingSite):
         else:
             log.info("Skipping release-time wait.")
 
+    async def wait_until_precreate_window(
+        self,
+        timing: TimingHelper,
+        release_time: datetime,
+        lead_seconds: float,
+        label: str,
+        options: RunOptions,
+    ) -> bool:
+        if options.skip_wait or options.debug:
+            log.info(f"Precreating {label} immediately for test mode")
+            return True
+
+        seconds_until_precreate = timing.secs_until(release_time) - max(0.0, lead_seconds)
+        if seconds_until_precreate > 0:
+            log.info(f"Waiting {seconds_until_precreate:.1f}s before {label} precreation")
+            await asyncio.sleep(seconds_until_precreate)
+        return True
+
+    async def finish_precreate_before_release(
+        self,
+        timing: TimingHelper,
+        release_time: datetime,
+        label: str,
+        precreate_coro,
+        options: RunOptions,
+    ):
+        if options.skip_wait or options.debug:
+            return await precreate_coro
+
+        remaining = max(0.0, timing.secs_until(release_time) - 0.1)
+        if remaining <= 0:
+            log.warning(f"{label} precreation window expired; continuing without it")
+            return None
+        try:
+            return await asyncio.wait_for(precreate_coro, timeout=remaining)
+        except asyncio.TimeoutError:
+            log.warning(f"{label} precreation did not finish before release; continuing without it")
+            return None
+
     async def maybe_precreate_payment_method(
         self,
         page: Page,
@@ -1346,17 +1469,53 @@ class ClubSparkSite(BookingSite):
         if prefetched_slot is None or current_user is None:
             return None
 
-        if options.skip_wait or options.debug:
-            log.info("Precreating Stripe payment method immediately for test mode")
-            return await self.precreate_stripe_payment_method(page, prefetched_slot, current_user)
+        await self.wait_until_precreate_window(
+            timing,
+            release_time,
+            self.precreate_stripe_pm_lead_seconds,
+            "Stripe payment method",
+            options,
+        )
+        return await self.finish_precreate_before_release(
+            timing,
+            release_time,
+            "Stripe payment method",
+            self.precreate_stripe_payment_method(page, prefetched_slot, current_user),
+            options,
+        )
 
-        precreate_lead_seconds = max(0.0, self.precreate_stripe_pm_lead_seconds)
-        seconds_until_precreate = timing.secs_until(release_time) - precreate_lead_seconds
-        if seconds_until_precreate > 0:
-            log.info(f"Waiting {seconds_until_precreate:.1f}s before Stripe payment method precreation")
-            await asyncio.sleep(seconds_until_precreate)
+    async def maybe_precreate_booking_payment(
+        self,
+        page: Page,
+        prefetched_slot: Optional[dict],
+        current_user: Optional[dict],
+        precreated_payment_method: Optional[dict],
+        timing: TimingHelper,
+        release_time: datetime,
+        options: RunOptions,
+    ) -> Optional[dict]:
+        if prefetched_slot is None or current_user is None:
+            return None
 
-        return await self.precreate_stripe_payment_method(page, prefetched_slot, current_user)
+        await self.wait_until_precreate_window(
+            timing,
+            release_time,
+            self.precreate_booking_payment_lead_seconds,
+            "ClubSpark payment token",
+            options,
+        )
+        return await self.finish_precreate_before_release(
+            timing,
+            release_time,
+            "ClubSpark payment token",
+            self.precreate_booking_payment(
+                page,
+                prefetched_slot,
+                current_user,
+                precreated_payment_method,
+            ),
+            options,
+        )
 
     async def resolve_slot_and_bootstrap(
         self,
@@ -1496,6 +1655,15 @@ class ClubSparkSite(BookingSite):
                     release_time,
                     options,
                 )
+                precreated_booking_payment = await self.maybe_precreate_booking_payment(
+                    page,
+                    prefetched_slot,
+                    current_user,
+                    precreated_payment_method,
+                    timing,
+                    release_time,
+                    options,
+                )
 
                 await self.wait_until_release(timing, release_time, options)
 
@@ -1518,6 +1686,7 @@ class ClubSparkSite(BookingSite):
                     form_token_override=(booking_bootstrap or {}).get("verification_token"),
                     runtime_override=(booking_bootstrap or {}).get("stripe_runtime"),
                     precreated_payment_method=precreated_payment_method,
+                    precreated_booking_payment=precreated_booking_payment,
                 )
             finally:
                 if options.debug:

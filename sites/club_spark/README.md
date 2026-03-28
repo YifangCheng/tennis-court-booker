@@ -40,8 +40,11 @@ This plugin now uses a direct submit path after release. The remaining browser d
 ## Speed Tuning
 
 - Stripe `payment_method` precreation is on by default.
+- ClubSpark `CreatePayment` precreation is also on by default, with fallback to a fresh post-release `CreatePayment` if the reused token is rejected.
 - If the reused precreated payment method fails before confirmation, the bot retries once with a fresh Stripe payment method.
 - `CLUB_SPARK_PRECREATE_STRIPE_PM_LEAD_SECONDS` controls how many seconds before release the precreation attempt runs.
 - `CLUB_SPARK_PRECREATED_STRIPE_PM_MAX_AGE_SECONDS` controls how old a cached Stripe payment method is allowed to be before the bot creates a fresh one.
+- `CLUB_SPARK_PRECREATE_BOOKING_PAYMENT_LEAD_SECONDS` controls how many seconds before release the ClubSpark `CreatePayment` precreation attempt runs.
+- `CLUB_SPARK_PRECREATED_BOOKING_PAYMENT_MAX_AGE_SECONDS` controls how old a cached ClubSpark payment token is allowed to be before the bot creates a fresh one.
 - `CLUB_SPARK_REQUEST_TIMEOUT_SECONDS` controls the timeout for the raw booking bootstrap request, Stripe `payment_methods`, `CreatePayment`, and `ConfirmBooking`.
 - `CLUB_SPARK_PAGE_TIMEOUT_SECONDS` controls the timeout for direct booking-page and confirmation-page navigations.
