@@ -49,17 +49,17 @@ class ClubSparkSite(BookingSite):
         self.card_number = os.environ.get("CARD_NUMBER", "")
         self.card_expiry = os.environ.get("CARD_EXPIRY", "")
         self.card_cvv = os.environ.get("CARD_CVV", "")
-        self.precreate_stripe_pm_enabled = os.environ.get("CLUB_SPARK_PRECREATE_STRIPE_PM", "").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
         self.precreate_stripe_pm_lead_seconds = float(
             os.environ.get("CLUB_SPARK_PRECREATE_STRIPE_PM_LEAD_SECONDS", "15")
         )
         self.precreated_stripe_pm_max_age_seconds = float(
             os.environ.get("CLUB_SPARK_PRECREATED_STRIPE_PM_MAX_AGE_SECONDS", "90")
+        )
+        self.request_timeout_ms = int(
+            float(os.environ.get("CLUB_SPARK_REQUEST_TIMEOUT_SECONDS", "30")) * 1000
+        )
+        self.page_timeout_ms = int(
+            float(os.environ.get("CLUB_SPARK_PAGE_TIMEOUT_SECONDS", "20")) * 1000
         )
 
         self.api_base_url = "https://clubspark.lta.org.uk"
@@ -594,7 +594,7 @@ class ClubSparkSite(BookingSite):
                     ),
                     "referer": self.booking_url_for(slot["date"]),
                 },
-                timeout=10_000,
+                timeout=self.request_timeout_ms,
                 fail_on_status_code=False,
             )
         except Exception:
@@ -623,7 +623,7 @@ class ClubSparkSite(BookingSite):
     async def goto_direct_booking_page(self, page: Page, slot: dict) -> bool:
         url = self.direct_booking_url(slot)
         try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=10_000)
+            await page.goto(url, wait_until="domcontentloaded", timeout=self.page_timeout_ms)
             await self.dismiss_cookie_banner(page)
             rejection_reason = self.booking_unsuccessful_reason(page.url)
             if rejection_reason:
@@ -980,7 +980,7 @@ class ClubSparkSite(BookingSite):
                 "origin": "https://js.stripe.com",
                 "referer": "https://js.stripe.com/",
             },
-            timeout=10_000,
+            timeout=self.request_timeout_ms,
             fail_on_status_code=False,
             max_redirects=0,
         )
@@ -1086,7 +1086,7 @@ class ClubSparkSite(BookingSite):
                 "content-type": "application/json",
                 "referer": referer_url or page.url,
             },
-            timeout=10_000,
+            timeout=self.request_timeout_ms,
             fail_on_status_code=False,
             max_redirects=0,
         )
@@ -1168,7 +1168,7 @@ class ClubSparkSite(BookingSite):
                 "content-type": "application/x-www-form-urlencoded",
                 "referer": referer_url or page.url,
             },
-            timeout=15_000,
+            timeout=self.request_timeout_ms,
             fail_on_status_code=False,
             max_redirects=0,
         )
@@ -1178,12 +1178,12 @@ class ClubSparkSite(BookingSite):
             if "BookingUnsuccessful" in target:
                 log.error(f"Direct confirm redirected to BookingUnsuccessful: {target}")
                 try:
-                    await page.goto(target, wait_until="domcontentloaded", timeout=10_000)
+                    await page.goto(target, wait_until="domcontentloaded", timeout=self.page_timeout_ms)
                 except Exception:
                     pass
                 return False
             try:
-                await page.goto(target, wait_until="domcontentloaded", timeout=10_000)
+                await page.goto(target, wait_until="domcontentloaded", timeout=self.page_timeout_ms)
             except Exception as exc:
                 log.error(f"Direct confirm redirect could not be opened: {exc}")
                 return False
@@ -1343,7 +1343,7 @@ class ClubSparkSite(BookingSite):
         release_time: datetime,
         options: RunOptions,
     ) -> Optional[dict]:
-        if not self.precreate_stripe_pm_enabled or prefetched_slot is None or current_user is None:
+        if prefetched_slot is None or current_user is None:
             return None
 
         if options.skip_wait or options.debug:

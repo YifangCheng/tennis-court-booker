@@ -37,8 +37,11 @@ Without `--date`, the plugin targets `today + 7 days`, which matches the site's 
 
 This plugin now uses a direct submit path after release. The remaining browser dependency is the booking-page bootstrap, which is used to obtain the verification token and Stripe runtime data when needed.
 
-## Experimental Speed Mode
+## Speed Tuning
 
-- Set `CLUB_SPARK_PRECREATE_STRIPE_PM=1` to precreate the Stripe `payment_method` shortly before release and reuse it after release.
+- Stripe `payment_method` precreation is on by default.
+- If the reused precreated payment method fails before confirmation, the bot retries once with a fresh Stripe payment method.
 - `CLUB_SPARK_PRECREATE_STRIPE_PM_LEAD_SECONDS` controls how many seconds before release the precreation attempt runs.
-- `CLUB_SPARK_PRECREATED_STRIPE_PM_MAX_AGE_SECONDS` controls how old the cached Stripe payment method is allowed to be before the bot creates a fresh one.
+- `CLUB_SPARK_PRECREATED_STRIPE_PM_MAX_AGE_SECONDS` controls how old a cached Stripe payment method is allowed to be before the bot creates a fresh one.
+- `CLUB_SPARK_REQUEST_TIMEOUT_SECONDS` controls the timeout for the raw booking bootstrap request, Stripe `payment_methods`, `CreatePayment`, and `ConfirmBooking`.
+- `CLUB_SPARK_PAGE_TIMEOUT_SECONDS` controls the timeout for direct booking-page and confirmation-page navigations.
