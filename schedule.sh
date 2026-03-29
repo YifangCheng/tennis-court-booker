@@ -10,6 +10,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON="$SCRIPT_DIR/.venv/bin/python"
 CAFFEINATE="/usr/bin/caffeinate"
+RUNNER="$SCRIPT_DIR/run_scheduled.sh"
 SITE_NAME=""
 ACCOUNT_NAME=""
 VENUE_NAME=""
@@ -70,6 +71,7 @@ fi
 
 LABEL_SUFFIX="$SITE_NAME"
 LOG_SUFFIX="$SITE_NAME"
+LOG_NAME_SUFFIX="$SITE_NAME"
 PROGRAM_ACCOUNT_ARGS=""
 PROGRAM_VENUE_ARGS=""
 PROGRAM_TIME_ARGS=""
@@ -78,6 +80,7 @@ if [[ -n "$ACCOUNT_NAME" ]]; then
     SAFE_ACCOUNT_NAME="${ACCOUNT_NAME//[^A-Za-z0-9_-]/_}"
     LABEL_SUFFIX="${SITE_NAME}.${SAFE_ACCOUNT_NAME}"
     LOG_SUFFIX="${SITE_NAME}_${SAFE_ACCOUNT_NAME}"
+    LOG_NAME_SUFFIX="${SITE_NAME}_${SAFE_ACCOUNT_NAME}"
     PROGRAM_ACCOUNT_ARGS=$(cat <<EOF
         <string>--account</string>
         <string>$ACCOUNT_NAME</string>
@@ -89,6 +92,7 @@ if [[ -n "$VENUE_NAME" ]]; then
     SAFE_VENUE_NAME="${VENUE_NAME//[^A-Za-z0-9_-]/_}"
     LABEL_SUFFIX="${LABEL_SUFFIX}.${SAFE_VENUE_NAME}"
     LOG_SUFFIX="${LOG_SUFFIX}_${SAFE_VENUE_NAME}"
+    LOG_NAME_SUFFIX="${LOG_NAME_SUFFIX}_${SAFE_VENUE_NAME}"
     PROGRAM_VENUE_ARGS=$(cat <<EOF
         <string>--venue</string>
         <string>$VENUE_NAME</string>
@@ -118,12 +122,16 @@ EOF
 fi
 
 PLIST_PATH="$HOME/Library/LaunchAgents/com.tennis.booker.${LABEL_SUFFIX}.plist"
-STDOUT_LOG="$LOG_DIR/booker_${LOG_SUFFIX}.log"
-STDERR_LOG="$LOG_DIR/booker_${LOG_SUFFIX}_error.log"
+LOG_PATTERN="$LOG_DIR/booker_${LOG_NAME_SUFFIX}_YYYYMMDD.log"
 
 # ── Validate ─────────────────────────────────────────────────────────────────
 if [ ! -f "$PYTHON" ]; then
     echo "ERROR: .venv not found. Run 'bash setup.sh' first."
+    exit 1
+fi
+
+if [ ! -f "$RUNNER" ]; then
+    echo "ERROR: scheduled runner not found at $RUNNER"
     exit 1
 fi
 
@@ -200,10 +208,7 @@ cat > "$PLIST_PATH" << PLIST
 
     <key>ProgramArguments</key>
     <array>
-        <string>$CAFFEINATE</string>
-        <string>-dimsu</string>
-        <string>$PYTHON</string>
-        <string>$SCRIPT_DIR/main.py</string>
+        <string>$RUNNER</string>
         <string>--site</string>
         <string>$SITE_NAME</string>
 $PROGRAM_ACCOUNT_ARGS
@@ -221,12 +226,6 @@ $PROGRAM_COURT_ARGS
 
     <key>WorkingDirectory</key>
     <string>$SCRIPT_DIR</string>
-
-    <key>StandardOutPath</key>
-    <string>$STDOUT_LOG</string>
-
-    <key>StandardErrorPath</key>
-    <string>$STDERR_LOG</string>
 
     <!-- Keep HOME for the Python process environment -->
     <key>EnvironmentVariables</key>
@@ -266,7 +265,7 @@ echo "  Wake: $WAKE_TIME"
 echo "  Start: $START_TIME"
 echo "  Booking Opens: $RELEASE_TIME"
 echo ""
-echo "Logs: $STDOUT_LOG"
+echo "Logs: $LOG_PATTERN"
 echo "Screenshots: $SCRIPT_DIR/screenshots/"
 echo ""
 echo "IMPORTANT — keep your Mac:"

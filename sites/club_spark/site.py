@@ -29,6 +29,8 @@ class ClubSparkSite(BookingSite):
         self.site_dir = Path(__file__).resolve().parent
         self.shots_dir = ROOT / "screenshots"
         self.shots_dir.mkdir(exist_ok=True)
+        self.logs_dir = ROOT / "logs"
+        self.logs_dir.mkdir(exist_ok=True)
         self.network_log_path = ROOT / "network_log.club_spark.json"
         self.live_network_log_path = ROOT / "network_log.club_spark.live.json"
         self.cookies_path = ROOT / "debug_cookies.club_spark.json"
@@ -113,6 +115,17 @@ class ClubSparkSite(BookingSite):
             self.preferred_courts = []
         else:
             self.preferred_courts = [int(options.court_override)]
+
+    def artifact_label(self, run_date_stamp: str) -> str:
+        venue_label = re.sub(r"[^A-Za-z0-9_-]+", "_", self.venue or "venue").strip("_") or "venue"
+        account_label = re.sub(r"[^A-Za-z0-9_-]+", "_", self.account_name or "account").strip("_") or "account"
+        return f"{self.name}_{account_label}_{venue_label}_{run_date_stamp}"
+
+    def configure_artifact_paths(self, run_date_stamp: str) -> None:
+        label = self.artifact_label(run_date_stamp)
+        self.network_log_path = self.logs_dir / f"network_log_{label}.json"
+        self.live_network_log_path = self.logs_dir / f"network_log_{label}.live.json"
+        self.cookies_path = self.logs_dir / f"debug_cookies_{label}.json"
 
     def booking_url_for(self, date: str) -> str:
         return f"{self.base_url}/Booking/BookByDate#?date={date}&role=guest"
@@ -626,6 +639,16 @@ class ClubSparkSite(BookingSite):
             "stripe_runtime": self.stripe_runtime_from_content(content),
         }
 
+    async def direct_booking_bootstrap_from_page(self, page: Page) -> dict:
+        verification_token = await self.request_verification_token(page)
+        stripe_runtime = await self.stripe_runtime(page)
+        return {
+            "response_url": page.url,
+            "rejection_reason": self.booking_unsuccessful_reason(page.url),
+            "verification_token": verification_token,
+            "stripe_runtime": stripe_runtime,
+        }
+
     async def goto_direct_booking_page(self, page: Page, slot: dict) -> bool:
         url = self.direct_booking_url(slot)
         try:
@@ -704,6 +727,7 @@ class ClubSparkSite(BookingSite):
                 page_task = None
 
                 if page_loaded:
+                    page_bootstrap = await self.direct_booking_bootstrap_from_page(page)
                     if bootstrap_task is not None:
                         if bootstrap_task.done():
                             try:
@@ -718,6 +742,23 @@ class ClubSparkSite(BookingSite):
                                 pass
                             except Exception:
                                 pass
+                    if booking_bootstrap is None:
+                        booking_bootstrap = page_bootstrap
+                    else:
+                        booking_bootstrap["response_url"] = (
+                            booking_bootstrap.get("response_url") or page_bootstrap.get("response_url")
+                        )
+                        booking_bootstrap["rejection_reason"] = (
+                            booking_bootstrap.get("rejection_reason") or page_bootstrap.get("rejection_reason")
+                        )
+                        booking_bootstrap["verification_token"] = (
+                            booking_bootstrap.get("verification_token") or page_bootstrap.get("verification_token")
+                        )
+                        booking_bootstrap["stripe_runtime"] = (
+                            booking_bootstrap.get("stripe_runtime") or page_bootstrap.get("stripe_runtime")
+                        )
+                    if not booking_bootstrap.get("verification_token") or not booking_bootstrap.get("stripe_runtime"):
+                        log.info("Direct booking page loaded before request bootstrap completed; continuing from page state")
                     return booking_bootstrap
 
                 if bootstrap_task is None:
@@ -1587,6 +1628,8 @@ class ClubSparkSite(BookingSite):
         booking_time = self.booking_time
         release_time = self.release_time(timing)
         wait_secs = timing.secs_until(release_time)
+        run_date_stamp = timing.now_true().strftime("%Y%m%d")
+        self.configure_artifact_paths(run_date_stamp)
 
         dry_run = options.debug and not options.force_pay
         mode = "DRY-RUN" if dry_run else ("DEBUG+PAY" if options.debug else "LIVE")
