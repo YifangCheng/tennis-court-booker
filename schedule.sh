@@ -254,10 +254,10 @@ if [[ -n "$VENUE_NAME" ]]; then
     echo "Scheduled venue: $VENUE_NAME"
 fi
 if [[ -n "$BOOKING_TIME" ]]; then
-    echo "Scheduled booking time override: $BOOKING_TIME"
+    echo "Scheduled booking time: $BOOKING_TIME"
 fi
 if [[ -n "$COURT_NUMBER" ]]; then
-    echo "Scheduled court override: $COURT_NUMBER"
+    echo "Scheduled court: $COURT_NUMBER"
 fi
 echo ""
 echo "Tonight:"
